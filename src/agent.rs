@@ -5,6 +5,7 @@ use crate::provider::{ApiMessage, AiProvider, ContentBlock};
 use crate::shell::ShellCtx;
 use crate::soul;
 use crate::tools;
+use crate::web::WebCtx;
 use anyhow::Result;
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
@@ -28,18 +29,27 @@ pub struct Agent {
     pub cfg: Config,
     /// State shell access (cwd per chat, pending confirmation, bot handle) — Pilar 9.
     pub shell: Arc<ShellCtx>,
+    /// State web access (search provider, HTTP client SSRF-safe, bot handle) — Pilar 10/12.
+    pub web: Arc<WebCtx>,
     /// Token usage in-memory per proses (persist menyusul kalau terbukti perlu — ROADMAP).
     pub usage: Arc<Mutex<UsageAcc>>,
     pub started: Instant,
 }
 
 impl Agent {
-    pub fn new(pool: PgPool, provider: Arc<dyn AiProvider>, cfg: Config, shell: Arc<ShellCtx>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        provider: Arc<dyn AiProvider>,
+        cfg: Config,
+        shell: Arc<ShellCtx>,
+        web: Arc<WebCtx>,
+    ) -> Self {
         Self {
             pool,
             provider,
             cfg,
             shell,
+            web,
             usage: Arc::new(Mutex::new(UsageAcc::default())),
             started: Instant::now(),
         }
@@ -53,9 +63,13 @@ impl Agent {
              (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
              owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
              efektif; command destruktif otomatis minta approval owner via tombol Telegram), \
-             `read_file`/`write_file` (hanya dalam workdir yang diizinkan). Gunakan proaktif \
+             `read_file`/`write_file` (hanya dalam workdir yang diizinkan), `web_search` \
+             (info terkini dari web), `fetch_url` (isi halaman sebagai markdown), \
+             `generate_image` (buat gambar → dikirim sebagai foto ke owner). Gunakan proaktif \
              tanpa diminta kalau konteksnya jelas. Untuk pekerjaan teknis: baca file yang \
-             relevan dulu sebelum mengubah apa pun.",
+             relevan dulu sebelum mengubah apa pun. Untuk pertanyaan yang butuh info terbaru \
+             (versi, harga, berita, error baru): selalu `web_search` dulu — jangan menebak \
+             dari pengetahuan lama.",
             soul::load(&self.cfg.soul_path),
             facts,
             chrono::Utc::now().to_rfc3339()
@@ -140,7 +154,7 @@ impl Agent {
             // Eksekusi semua tool call, kirim hasilnya sebagai tool_result
             let mut results = Vec::new();
             for (id, name, input) in tool_uses {
-                let out = match tools::execute(&self.shell, chat_id, &name, &input).await {
+                let out = match tools::execute(&self.shell, &self.web, chat_id, &name, &input).await {
                     Ok(s) => s,
                     Err(e) => format!("❌ tool error: {:#}", e),
                 };

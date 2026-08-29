@@ -24,6 +24,14 @@ pub struct Config {
     pub run_cmd_timeout: u64,
     /// Timeout menunggu approval destructive command (detik).
     pub confirm_timeout: u64,
+    /// Backend pencarian web (Pilar 10 — pola sama seperti AI_PROVIDER). Default: tavily.
+    pub search_provider: String,
+    /// API key Tavily — tanpa ini tool web_search balas pesan konfigurasi.
+    pub tavily_api_key: Option<String>,
+    /// Timeout per request fetch_url (detik).
+    pub fetch_timeout: u64,
+    /// Timeout generate_image (detik) — generasi gambar bisa lambat.
+    pub image_timeout: u64,
 }
 
 impl Config {
@@ -87,6 +95,21 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            search_provider: env::var("SEARCH_PROVIDER")
+                .unwrap_or_else(|_| "tavily".into())
+                .to_ascii_lowercase(),
+            tavily_api_key: env::var("TAVILY_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            fetch_timeout: env::var("FETCH_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            image_timeout: env::var("IMAGE_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
         })
     }
 }

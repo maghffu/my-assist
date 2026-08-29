@@ -2,11 +2,12 @@ use crate::memory;
 use crate::provider::ToolDef;
 use crate::reminders;
 use crate::shell::ShellCtx;
+use crate::web::WebCtx;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 /// Definisi tools yang diekspos ke LLM (Fase 2: reminder + memory;
-/// Fase 4+ menambah run_command/read_file/write_file, web, skills, image — lihat ROADMAP).
+/// Fase 4: run_command/read_file/write_file; Fase 5: web_search/fetch_url/generate_image).
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -114,11 +115,72 @@ pub fn definitions() -> Vec<ToolDef> {
                 "required": ["path", "content"]
             }),
         },
+        ToolDef {
+            name: "web_search".into(),
+            description: "Cari informasi terkini di web (berita, versi library terbaru, harga, \
+                error message, dokumentasi). WAJIB dipakai untuk pertanyaan yang butuh info lebih \
+                baru dari pengetahuanmu — jangan menebak dari ingatan lama. Return daftar hasil \
+                {judul, url, snippet} — sering sudah cukup untuk menjawab tanpa fetch halaman."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Query pencarian — spesifik, dalam bahasa yang paling relevan untuk topiknya"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Jumlah hasil (1-10, default 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "fetch_url".into(),
+            description: "Ambil isi sebuah URL publik sebagai teks/markdown bersih. Gunakan \
+                setelah web_search kalau perlu isi halaman penuh (dokumentasi, artikel, changelog). \
+                Konten > 15 ribu karakter otomatis dipotong untuk context; versi penuh dikirim \
+                ke owner sebagai file. Hanya URL publik http/https — bukan IP internal/localhost."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL lengkap http/https" }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDef {
+            name: "generate_image".into(),
+            description: "Buat gambar dari deskripsi teks dan kirim langsung ke owner sebagai \
+                foto (1024x1024, Pollinations). Prompt yang baik: subjek + gaya visual + mood + \
+                lighting + detail penting. Kamu TIDAK bisa melihat hasilnya — kalau owner minta \
+                revisi (misal 'birunya kurang'), panggil lagi dengan prompt yang dimodifikasi."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Deskripsi gambar yang diinginkan, detail dan spesifik"
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        },
     ]
 }
 
 /// Eksekusi tool call dari LLM. Return string hasil yang dikirim balik sebagai tool_result.
-pub async fn execute(shell: &ShellCtx, chat_id: i64, name: &str, input: &Value) -> Result<String> {
+pub async fn execute(
+    shell: &ShellCtx,
+    web: &WebCtx,
+    chat_id: i64,
+    name: &str,
+    input: &Value,
+) -> Result<String> {
     let pool = &shell.pool;
     match name {
         "create_reminder" => {
@@ -184,6 +246,28 @@ pub async fn execute(shell: &ShellCtx, chat_id: i64, name: &str, input: &Value) 
                 bail!("parameter 'path' wajib diisi");
             }
             shell.write_file(chat_id, &path, &content).await
+        }
+        "web_search" => {
+            let query = input["query"].as_str().unwrap_or("").trim().to_string();
+            if query.is_empty() {
+                bail!("parameter 'query' wajib diisi");
+            }
+            let max = input["max_results"].as_u64().unwrap_or(5) as usize;
+            web.web_search(&query, max).await
+        }
+        "fetch_url" => {
+            let url = input["url"].as_str().unwrap_or("").trim().to_string();
+            if url.is_empty() {
+                bail!("parameter 'url' wajib diisi");
+            }
+            web.fetch_url(chat_id, &url).await
+        }
+        "generate_image" => {
+            let prompt = input["prompt"].as_str().unwrap_or("").trim().to_string();
+            if prompt.is_empty() {
+                bail!("parameter 'prompt' wajib diisi");
+            }
+            web.generate_image(chat_id, &prompt).await
         }
         other => bail!("tool tidak dikenal: {}", other),
     }

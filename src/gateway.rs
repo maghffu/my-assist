@@ -177,10 +177,12 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
         "/start" | "/help" => Ok(HELP_TEXT.into()),
 
         "/status" => Ok(format!(
-            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nprovider: `{}`\nmodel: `{}`\ncontext: {} pesan terakhir\ndb: terhubung ✅",
+            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nprovider: `{}`\nmodel: `{}`\nsearch: `{}`{}\ncontext: {} pesan terakhir\ndb: terhubung ✅",
             agent.started.elapsed().as_secs_f64(),
             agent.provider.name(),
             agent.provider.model_name(),
+            agent.cfg.search_provider,
+            if agent.cfg.tavily_api_key.is_some() { "" } else { " (⚠️ tanpa TAVILY_API_KEY)" },
             agent.cfg.n_context,
         )),
 

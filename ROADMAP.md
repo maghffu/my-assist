@@ -15,7 +15,7 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 | 2 | Agent loop + tools inti (reminder, memory) | ✅ selesai |
 | 3 | Telegram gateway: polling, allowlist, slash commands | ✅ selesai |
 | 4 | Shell access (`run_command`, file tools, confirmation) | ✅ selesai |
-| 5 | Web search, fetch_url chain, image generation | ⬜ |
+| 5 | Web search, fetch_url chain, image generation | ✅ selesai |
 | 6 | Memory depth: background review, dreaming, skills | ⬜ |
 | 7 | OCR (Tesseract) | ⬜ |
 | 8 | Hardening & deploy VPS | ⬜ |
@@ -23,6 +23,8 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 **Status verifikasi Fase 0–3 (2026-08-29):** `cargo build` hijau ✅ · binary jalan + validasi config graceful ✅ · migrasi belum bisa dites lokal (PostgreSQL portable diblokir endpoint security mesin dev — exception `0xC0000142` pada child process; detail di bawah) — migrasi akan tervalidasi saat dijalankan di VPS.
 
 **Status verifikasi Fase 4 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 4/4 lulus (destructive detection, masking, cwd marker, confirm parsing) ✅ · migrasi tervalidasi via `hermes-lite migrate` (Postgres 17 docker, 4 tabel + `_sqlx_migrations`) ✅ · bot live long polling dengan wiring shell + callback handler confirmation gate ✅ · smoke test mekanik wrapper bash + marker cwd ✅. End-to-end `run_command` via Telegram menyusul diuji owner (perlu tap approve di keyboard konfirmasi).
+
+**Status verifikasi Fase 5 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 14/14 lulus (SSRF IP ranges, URL validation, HTML strip, entity decode, Tavily parsing, formatting caps, urlencoding) + 2 integration test network `cargo test -- --ignored` lulus (SSRF guard menolak `localtest.me`→127.0.0.1 + cloud metadata + IP literal private; fetch chain example.com via markdown.new) ✅ · smoke test `generate_image` (Pollinations → send_photo) & `web_search` live via Telegram menyusul diuji owner — butuh `TAVILY_API_KEY` di .env utk search.
 
 ### Terverifikasi berjalan di mesin dev
 
@@ -91,8 +93,11 @@ cargo build          # ✅ hijau (2 m 21s first build)
 
 ## Fase 5 — Web & Image (Pilar 10 + 12)
 
-- `SEARCH_PROVIDER` abstraction + Tavily primary; `fetch_url` chain 4-tier (`Accept: text/markdown` → markdown.new → r.jina.ai → readability) + SSRF guard
-- `generate_image` via Pollinations → `send_photo`
+- ✅ `SEARCH_PROVIDER` abstraction (trait `SearchProvider`) + Tavily primary; tanpa key → tool balas pesan konfigurasi (bot tetap jalan)
+- ✅ `fetch_url` chain 4-tier (`Accept: text/markdown` → markdown.new → r.jina.ai → HTML strip lokal) + SSRF guard dua lapis (pre-check DNS + custom resolver reqwest yang berlaku juga utk redirect) + size cap 2MB/request, context 15K char, versi penuh jadi file attachment
+- ✅ `generate_image` via Pollinations → `send_photo` (timeout 60s, konfirmasi teks ke LLM)
+- Env baru: `SEARCH_PROVIDER`, `TAVILY_API_KEY`, `FETCH_TIMEOUT=30`, `IMAGE_TIMEOUT=60`
+- Integration test network: `cargo test -- --ignored`
 
 ## Fase 6 — Memory Depth (Pilar 5/6/11)
 

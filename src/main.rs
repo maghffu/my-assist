@@ -9,6 +9,7 @@ mod reminders;
 mod shell;
 mod soul;
 mod tools;
+mod web;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -37,11 +38,12 @@ async fn main() -> Result<()> {
     db::run_migrations(&pool).await?;
 
     let ai = provider::build(&cfg)?;
-    // Bot & ShellCtx dibuat sebelum Agent: ShellCtx memegang bot (utk kirim keyboard
-    // konfirmasi & file output) dan Agent memegang ShellCtx (Pilar 9).
+    // Bot & ShellCtx/WebCtx dibuat sebelum Agent: keduanya memegang bot (utk kirim file,
+    // foto, keyboard konfirmasi) dan Agent memegang keduanya (Pilar 9/10/12).
     let bot = teloxide::Bot::new(cfg.telegram_bot_token.clone());
     let shell = shell::ShellCtx::new(&cfg, bot.clone(), pool.clone());
-    let agent = Arc::new(agent::Agent::new(pool, ai, cfg, shell));
+    let web = web::WebCtx::new(&cfg, bot.clone());
+    let agent = Arc::new(agent::Agent::new(pool, ai, cfg, shell, web));
 
     tracing::info!(
         provider = agent.provider.name(),
