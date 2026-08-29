@@ -1,0 +1,285 @@
+use crate::agent::Agent;
+use crate::{memory, reminders};
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
+use teloxide::prelude::*;
+use teloxide::types::{ChatAction, ChatId};
+
+const HELP_TEXT: &str = "🤖 **Hermes-Lite**\n\
+\n\
+Chat langsung aja — aku inget konteks & fakta penting tentang kamu.\n\
+\n\
+**Perintah:**\n\
+/status — uptime, provider, model\n\
+/memory — lihat fakta yang kupelajari (/memory del <id> untuk hapus)\n\
+/reminders — daftar pengingat (/reminders del <id> untuk hapus)\n\
+/provider — info AI provider aktif\n\
+/usage — pemakaian token proses ini\n\
+/help — tulisan ini";
+
+pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
+    // Reminder trigger loop — polling tiap 30 detik (Pilar 4)
+    {
+        let bot = bot.clone();
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = process_due_reminders(&bot, &agent).await {
+                    tracing::error!("reminder loop error: {:#}", e);
+                }
+            }
+        });
+    }
+
+    let handler_agent = agent.clone();
+    teloxide::repl(bot, move |bot: Bot, msg: Message| {
+        let agent = handler_agent.clone();
+        async move {
+            if let Err(e) = handle_message(bot, msg, agent).await {
+                tracing::error!("message handler error: {:#}", e);
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    Ok(())
+}
+
+async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()> {
+    let chat_id = msg.chat.id.0;
+
+    // Hard allowlist (Pilar 9 keamanan #1): drop diam-diam, tanpa balasan.
+    if !agent.cfg.allowed_chat_ids.contains(&chat_id) {
+        tracing::warn!(chat_id, "pesan dari chat di luar allowlist — di-drop");
+        return Ok(());
+    }
+
+    let text = match msg.text() {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => return Ok(()),
+    };
+
+    // Typing indicator fire-and-forget (UX murah)
+    {
+        let b = bot.clone();
+        let cid = msg.chat.id;
+        tokio::spawn(async move {
+            let _ = b.send_chat_action(cid, ChatAction::Typing).await;
+        });
+    }
+
+    let outcome: Result<String> = if text.starts_with('/') {
+        handle_command(&agent, chat_id, &text).await
+    } else {
+        agent.run_turn(chat_id, &text, true).await
+    };
+
+    match outcome {
+        Ok(reply) => send_long(&bot, msg.chat.id, &reply).await?,
+        Err(e) => {
+            tracing::error!(chat_id, "turn error: {:#}", e);
+            let msg_text: String = e.to_string().chars().take(500).collect();
+            bot.send_message(msg.chat.id, format!("⚠️ Error: {}", msg_text))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Slash commands — diproses langsung di gateway TANPA lewat LLM (murah & deterministik).
+async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<String> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let cmd = parts.first().copied().unwrap_or("");
+
+    match cmd {
+        "/start" | "/help" => Ok(HELP_TEXT.into()),
+
+        "/status" => Ok(format!(
+            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nprovider: `{}`\nmodel: `{}`\ncontext: {} pesan terakhir\ndb: terhubung ✅",
+            agent.started.elapsed().as_secs_f64(),
+            agent.provider.name(),
+            agent.provider.model_name(),
+            agent.cfg.n_context,
+        )),
+
+        "/memory" => {
+            if parts.len() >= 3 && parts[1] == "del" {
+                let id: i64 = parts[2]
+                    .parse()
+                    .context("id harus angka — contoh: /memory del 42")?;
+                let ok = memory::delete_fact(&agent.pool, chat_id, id).await?;
+                return Ok(if ok {
+                    format!("🗑️ Memory #{} dihapus", id)
+                } else {
+                    format!("Memory #{} tidak ditemukan", id)
+                });
+            }
+            let facts = memory::list_facts(&agent.pool, chat_id, 20).await?;
+            if facts.is_empty() {
+                return Ok("(belum ada memory tersimpan)".into());
+            }
+            let body = facts
+                .iter()
+                .map(|f| format!("[{}] ({}) {}", f.id, f.fact_type, f.fact))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "🧠 **Memory** ({} terakhir):\n{}\n\nhapus: /memory del <id>",
+                facts.len(),
+                body
+            ))
+        }
+
+        "/reminders" => {
+            if parts.len() >= 3 && parts[1] == "del" {
+                let id: i64 = parts[2]
+                    .parse()
+                    .context("id harus angka — contoh: /reminders del 7")?;
+                let ok = reminders::delete(&agent.pool, chat_id, id).await?;
+                return Ok(if ok {
+                    format!("🗑️ Reminder #{} dihapus", id)
+                } else {
+                    format!("Reminder #{} tidak ditemukan", id)
+                });
+            }
+            let list = reminders::list_pending(&agent.pool, chat_id, 10).await?;
+            if list.is_empty() {
+                return Ok("(tidak ada reminder pending)".into());
+            }
+            let body = list
+                .iter()
+                .map(|r| {
+                    format!(
+                        "[{}] {} — {} [{}{}]",
+                        r.id,
+                        reminders::fmt_jakarta(r.remind_at),
+                        r.message,
+                        r.kind,
+                        r.recur
+                            .as_deref()
+                            .map(|c| format!(", {}", c))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "⏰ **Reminders** ({} pending):\n{}\n\nhapus: /reminders del <id>",
+                list.len(),
+                body
+            ))
+        }
+
+        "/provider" => Ok(format!(
+            "🔌 Provider aktif: `{}` ({})\nSwitching runtime antar provider menyusul \
+             bersama impl provider berikutnya (ROADMAP Fase 5+). Set via env `AI_PROVIDER`.",
+            agent.provider.name(),
+            agent.provider.model_name()
+        )),
+
+        "/usage" => {
+            let u = agent.usage.lock().unwrap();
+            Ok(format!(
+                "📊 Token usage (proses ini, reset saat restart):\ninput: {}\noutput: {}\nturns: {}",
+                u.input_tokens, u.output_tokens, u.turns
+            ))
+        }
+
+        "/skills" => Ok("📚 Skills belum diimplementasikan (ROADMAP Fase 6).".into()),
+
+        other => Ok(format!(
+            "Perintah {} tidak dikenal — ketik /help.",
+            other
+        )),
+    }
+}
+
+/// Reminder loop: kirim static reminder / eksekusi job / reschedule recurring (Pilar 4).
+async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
+    for r in reminders::due_now(&agent.pool).await? {
+        tracing::info!(reminder_id = r.id, kind = %r.kind, "firing reminder");
+
+        let outcome: Result<()> = async {
+            match r.kind.as_str() {
+                "job" => {
+                    // Job: agent mengeksekusi instruksi dengan context segar (Pilar 4)
+                    let out = agent
+                        .run_turn(
+                            r.chat_id,
+                            &format!("⚙️ [scheduled job] {}", r.message),
+                            false,
+                        )
+                        .await?;
+                    send_long(bot, ChatId(r.chat_id), &format!("⚙️ Job selesai:\n{}", out))
+                        .await?;
+                }
+                _ => {
+                    bot.send_message(ChatId(r.chat_id), format!("⏰ {}", r.message))
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        match outcome {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(reminder_id = r.id, "reminder gagal dikirim: {:#}", e);
+                continue; // jangan mark sent kalau gagal — coba lagi tick berikutnya
+            }
+        }
+
+        match r
+            .recur
+            .as_deref()
+            .and_then(|rec| reminders::compute_next_run(rec, r.remind_at))
+        {
+            Some(next) => reminders::reschedule(&agent.pool, r.id, next).await?,
+            None => reminders::mark_sent(&agent.pool, r.id).await?,
+        }
+    }
+    Ok(())
+}
+
+/// Telegram limit 4096 char/pesan — chunk 3800 dengan backtrack ke newline.
+async fn send_long(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
+    for chunk in split_message(text) {
+        bot.send_message(chat_id, chunk).await?;
+    }
+    Ok(())
+}
+
+pub fn split_message(text: &str) -> Vec<String> {
+    const MAX: usize = 3800;
+    if text.chars().count() <= MAX {
+        return vec![text.to_string()];
+    }
+
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > MAX {
+        let mut cut = rest
+            .char_indices()
+            .nth(MAX)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        // backtrack ke newline biar chunk tidak motong di tengah kalimat
+        if let Some(pos) = rest[..cut].rfind('\n') {
+            if pos > MAX / 2 {
+                cut = pos + 1;
+            }
+        }
+        let (chunk, remainder) = rest.split_at(cut);
+        out.push(chunk.to_string());
+        rest = remainder;
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
