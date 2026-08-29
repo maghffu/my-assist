@@ -16,7 +16,7 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 | 3 | Telegram gateway: polling, allowlist, slash commands | ✅ selesai |
 | 4 | Shell access (`run_command`, file tools, confirmation) | ✅ selesai |
 | 5 | Web search, fetch_url chain, image generation | ✅ selesai |
-| 6 | Memory depth: background review, dreaming, skills | ⬜ |
+| 6 | Memory depth: background review, dreaming, skills | ✅ selesai |
 | 7 | OCR (Tesseract) | ⬜ |
 | 8 | Hardening & deploy VPS | ⬜ |
 
@@ -25,6 +25,8 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 **Status verifikasi Fase 4 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 4/4 lulus (destructive detection, masking, cwd marker, confirm parsing) ✅ · migrasi tervalidasi via `hermes-lite migrate` (Postgres 17 docker, 4 tabel + `_sqlx_migrations`) ✅ · bot live long polling dengan wiring shell + callback handler confirmation gate ✅ · smoke test mekanik wrapper bash + marker cwd ✅. End-to-end `run_command` via Telegram menyusul diuji owner (perlu tap approve di keyboard konfirmasi).
 
 **Status verifikasi Fase 5 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 14/14 lulus (SSRF IP ranges, URL validation, HTML strip, entity decode, Tavily parsing, formatting caps, urlencoding) + 2 integration test network `cargo test -- --ignored` lulus (SSRF guard menolak `localtest.me`→127.0.0.1 + cloud metadata + IP literal private; fetch chain example.com via markdown.new) ✅ · smoke test `generate_image` (Pollinations → send_photo) & `web_search` live via Telegram menyusul diuji owner — butuh `TAVILY_API_KEY` di .env utk search.
+
+**Status verifikasi Fase 6 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 22/22 lulus (slugify, save/list/delete roundtrip, path traversal guard, keyword injection, JSON parse robust, duplikat detection, dream action shape) ✅ · `generate_image` sudah diverifikasi owner live (gambar kucing nyampe) ✅ · background review & dreaming live via Telegram menyusul diuji owner (`/dream` utk trigger manual).
 
 ### Terverifikasi berjalan di mesin dev
 
@@ -101,9 +103,10 @@ cargo build          # ✅ hijau (2 m 21s first build)
 
 ## Fase 6 — Memory Depth (Pilar 5/6/11)
 
-- Background review pasca-turn (`tokio::spawn`, prompt FACT/INFERRED, anti-duplikat)
-- Dreaming cycle mingguan (merge/upgrade/hapus) untuk memory **dan** skills
-- `skills/` dir + `save_skill` + injection ke system prompt
+- ✅ Background review pasca-turn: `tokio::spawn` fire-and-forget dari gateway (tanpa latency), LLM call tanpa tools + output JSON, fakta `explicit`/`inferred`, anti-duplikat 2 lapis (prompt + normalized containment Rust-side), skip pertukaran pendek (<120 char), token tercatat di `/usage`
+- ✅ Dreaming cycle: otomatis mingguan (interval_at +7 hari, BUKAN immediately) + `/dream` manual — konsolidasi memory (drop/rewrite/upgrade inferred→explicit, validasi id anti-halusinasi, max 20 aksi/chat, konservatif: parse gagal → skip) dan review skills (delete/rewrite/merge)
+- ✅ Skills: `save_skill` (slugify nama, anti-trivial min 80 char, cap 20KB, path traversal guard), storage file `skills/*.md`, injection ke system prompt (daftar nama selalu + skill cocok keyword dimuat penuh, max 3 file × 4K char; sisanya via `read_file skills/<nama>.md`)
+- ✅ `/skills` (list) + `/dream` (trigger manual); env baru: `SKILLS_DIR` (default `skills`)
 
 ## Fase 7 — OCR (Pilar 7)
 
