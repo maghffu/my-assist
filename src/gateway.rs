@@ -1,5 +1,5 @@
 use crate::agent::Agent;
-use crate::{memory, reminders, review, shell, skills};
+use crate::{memory, ocr, reminders, review, shell, skills};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,11 +160,15 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()>
         return Ok(());
     }
 
+    // Foto → OCR → turn agent (Pilar 7) — sebelum branch teks (foto tak punya text).
+    if let Some(photos) = msg.photo() {
+        return handle_photo(&bot, &msg, &agent, photos).await;
+    }
+
     let text = match msg.text() {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => return Ok(()),
     };
-
     // Typing indicator fire-and-forget (UX murah)
     {
         let b = bot.clone();
@@ -191,6 +195,59 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()>
             let msg_text: String = e.to_string().chars().take(500).collect();
             bot.send_message(msg.chat.id, format!("⚠️ Error: {}", msg_text))
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Foto dari owner: download resolusi terbesar → OCR Tesseract lokal → teks jadi
+/// prompt biasa → turn agent penuh (tools tersedia). Kualitas OCR bergantung kualitas
+/// gambar (Pilar 7 trade-off yang disadari).
+async fn handle_photo(bot: &Bot, msg: &Message, agent: &Arc<Agent>, photos: &[teloxide::types::PhotoSize]) -> Result<()> {
+    let chat_id = msg.chat.id.0;
+    {
+        let b = bot.clone();
+        let cid = msg.chat.id;
+        tokio::spawn(async move {
+            let _ = b.send_chat_action(cid, ChatAction::Typing).await;
+        });
+    }
+
+    let largest = ocr::largest_photo(photos);
+    let bytes = ocr::download_photo(bot, largest).await?;
+    tracing::info!(chat_id, bytes = bytes.len(), "foto diterima — OCR");
+
+    let text = match ocr::extract_text(bytes, &agent.cfg.ocr_lang, agent.cfg.ocr_tessdata.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(chat_id, "OCR gagal: {e:#}");
+            let m: String = format!("⚠️ OCR gagal: {e:#}").chars().take(400).collect();
+            bot.send_message(msg.chat.id, m).await?;
+            return Ok(());
+        }
+    };
+
+    // Nggak nemu teks → jawab langsung tanpa LLM call (murah & deterministik)
+    if text.chars().count() < 12 {
+        bot.send_message(
+            msg.chat.id,
+            "🤷 OCR tidak menemukan teks yang terbaca dari foto ini. Coba foto lebih \
+             tegak/terang, atau ketik isinya langsung.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let prompt = ocr::build_prompt(msg.caption(), &text);
+    match agent.run_turn(chat_id, &prompt, true).await {
+        Ok(reply) => {
+            review::spawn_post_turn_review(agent.clone(), chat_id, prompt, reply.clone());
+            send_long(bot, msg.chat.id, &reply).await?;
+        }
+        Err(e) => {
+            tracing::error!(chat_id, "photo turn error: {:#}", e);
+            let m: String = e.to_string().chars().take(500).collect();
+            bot.send_message(msg.chat.id, format!("⚠️ Error: {m}")).await?;
         }
     }
     Ok(())

@@ -34,6 +34,10 @@ pub struct Config {
     pub image_timeout: u64,
     /// Direktori skills (Pilar 11) — file markdown, satu file per skill.
     pub skills_dir: String,
+    /// Bahasa OCR Tesseract (Pilar 7) — multi-bahasa dipisah +.
+    pub ocr_lang: String,
+    /// Path tessdata opsional (default: path kompilasi Tesseract).
+    pub ocr_tessdata: Option<String>,
 }
 
 impl Config {
@@ -113,6 +117,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
             skills_dir: env::var("SKILLS_DIR").unwrap_or_else(|_| "skills".into()),
+            ocr_lang: env::var("OCR_LANG").unwrap_or_else(|_| "eng+ind".into()),
+            ocr_tessdata: env::var("OCR_TESSDATA")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

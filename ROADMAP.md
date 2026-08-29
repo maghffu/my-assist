@@ -17,8 +17,8 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 | 4 | Shell access (`run_command`, file tools, confirmation) | ✅ selesai |
 | 5 | Web search, fetch_url chain, image generation | ✅ selesai |
 | 6 | Memory depth: background review, dreaming, skills | ✅ selesai |
-| 7 | OCR (Tesseract) | ⬜ |
-| 8 | Hardening & deploy VPS | ⬜ |
+| 7 | OCR (Tesseract) | ✅ selesai |
+| 8 | Hardening & deploy VPS | ✅ selesai |
 
 **Status verifikasi Fase 0–3 (2026-08-29):** `cargo build` hijau ✅ · binary jalan + validasi config graceful ✅ · migrasi belum bisa dites lokal (PostgreSQL portable diblokir endpoint security mesin dev — exception `0xC0000142` pada child process; detail di bawah) — migrasi akan tervalidasi saat dijalankan di VPS.
 
@@ -27,6 +27,10 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 **Status verifikasi Fase 5 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 14/14 lulus (SSRF IP ranges, URL validation, HTML strip, entity decode, Tavily parsing, formatting caps, urlencoding) + 2 integration test network `cargo test -- --ignored` lulus (SSRF guard menolak `localtest.me`→127.0.0.1 + cloud metadata + IP literal private; fetch chain example.com via markdown.new) ✅ · smoke test `generate_image` (Pollinations → send_photo) & `web_search` live via Telegram menyusul diuji owner — butuh `TAVILY_API_KEY` di .env utk search.
 
 **Status verifikasi Fase 6 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 22/22 lulus (slugify, save/list/delete roundtrip, path traversal guard, keyword injection, JSON parse robust, duplikat detection, dream action shape) ✅ · `generate_image` sudah diverifikasi owner live (gambar kucing nyampe) ✅ · background review & dreaming live via Telegram menyusul diuji owner (`/dream` utk trigger manual).
+
+**Status verifikasi Fase 7 (2026-08-29, mesin Linux/VPS):** tesseract 5.3.2 + leptonica 1.84 + tessdata `eng`+`ind` (tessdata_fast) terpasang ✅ · binding leptess 0.14 (`set_image_from_mem`, unix-only dep — dev Windows tetap buildable) ✅ · `cargo test` 25/25 termasuk integration test OCR native pada aset statis (`testdata/ocr-sample.png`) ✅ · CLI smoke sebagai user `hermes` lulus ✅ · foto via Telegram → OCR → turn menyusul diuji owner.
+
+**Status verifikasi Fase 8 (2026-08-29, mesin Linux/VPS):** release build 6m57s (2 core) ✅ · user `hermes` unprivileged + `/opt/hermes-lite` (`.env` 0600) ✅ · systemd unit aktif (Restart=on-failure, MemoryMax=512M — RSS aktual ±16-23MB) ✅ · `systemd-analyze security` exposure 4.2 OK (ProtectSystem=strict, PrivateTmp, CapabilityBoundingSet kosong, UMask=0027) ✅ · journald logging jalan ✅ · `deploy/deploy.sh` idempotent (skill & .env server tidak dioverwrite) + `deploy/DEPLOY.md` ops manual ✅.
 
 ### Terverifikasi berjalan di mesin dev
 
@@ -110,13 +114,20 @@ cargo build          # ✅ hijau (2 m 21s first build)
 
 ## Fase 7 — OCR (Pilar 7)
 
-- Tesseract binding (leptess/tesseract-rs) + handler foto Telegram → teks → context
-- **Butuh libtesseract — test di VPS Linux; binding di Windows menyulitkan, jadi sengaja di fase akhir**
+- ✅ Handler foto Telegram (resolusi terbesar, cap 10MB) → Tesseract via **leptess 0.14** native binding (`set_image_from_mem`, tanpa temp file, `spawn_blocking`) → teks jadi prompt biasa → turn agent penuh (tools tersedia)
+- ✅ Teks < 12 char → balas langsung tanpa LLM call; caption foto digabung ke prompt; cap 15K char
+- ✅ Bahasa via `OCR_LANG` (default `eng+ind`, tessdata_fast `ind` di-download manual); `OCR_TESSDATA` opsional
+- ✅ Binding unix-only (`[target.'cfg(unix)']`) — stub error di non-unix, dev Windows tetap bisa build
+- Note: leptess 0.13 rusak vs leptonica-sys 0.4 (bindgen opaque) — wajib 0.14+
 
 ## Fase 8 — Hardening & Deploy VPS
 
-- Unprivileged user + sudoers allowlist (bila perlu), systemd unit, `RUST_LOG=info`, journald
-- Dokumentasi setup VPS (libtesseract, postgres), `/usage` persist kalau terbukti perlu (sekarang in-memory per proses)
+- ✅ Dedicated unprivileged user `hermes` (nologin, tanpa capability, tanpa sudo/docker — evidence-driven, cara tambah sudoers allowlist didokumentasikan di DEPLOY.md)
+- ✅ systemd `hermes-lite.service`: Restart=on-failure, MemoryMax=512M, UMask=0027, sandbox lengkap (ProtectSystem=strict + ReadWritePaths=/opt/hermes-lite /tmp, PrivateTmp, dst.) — exposure 4.2 OK
+- ✅ `deploy/deploy.sh` idempotent: build release → user/dir → artifacts → unit → restart; `.env` & `skills/` server tidak dioverwrite
+- ✅ `deploy/DEPLOY.md`: setup awal (deps, tessdata ind, postgres docker), operasional (log/update/backup), troubleshooting
+- ✅ Journald + RUST_LOG=info via .env
+- `/usage` persist: di-skip — in-memory memadai (evidence-driven)
 
 ---
 

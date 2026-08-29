@@ -4,6 +4,7 @@ mod context;
 mod db;
 mod gateway;
 mod memory;
+mod ocr;
 mod provider;
 mod reminders;
 mod review;

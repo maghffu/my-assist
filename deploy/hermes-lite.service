@@ -1,0 +1,48 @@
+# Hermes-Lite — systemd unit (ROADMAP Fase 8)
+# Install: cp deploy/hermes-lite.service /etc/systemd/system/ && systemctl daemon-reload
+#
+# Hardening (AGENTS.md Pilar 9 keamanan #2):
+# - Dedicated unprivileged user `hermes` (bukan root), tanpa capability
+# - ProtectSystem=strict: seluruh FS read-only KECUALI /opt/hermes-lite (skills,
+#   write_file) dan /tmp (PrivateTmp — per-service, tak terlihat proses lain)
+# - bash -l utk run_command tetap jalan (read /etc/profile cukup, non-interaktif)
+
+[Unit]
+Description=Hermes-Lite — personal AI agent (Telegram)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes-lite
+ExecStart=/opt/hermes-lite/hermes-lite
+Restart=on-failure
+RestartSec=5
+UMask=0027
+
+# Resource guard (VPS kecil: tesseract eng+ind bisa spike ~300MB saat OCR)
+MemoryMax=512M
+LimitNOFILE=65536
+
+# Sandbox
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/hermes-lite /tmp
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
