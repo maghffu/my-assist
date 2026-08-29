@@ -979,6 +979,7 @@ mod tests {
             tavily_api_key: None,
             fetch_timeout: 30,
             image_timeout: 60,
+            skills_dir: "skills".into(),
         };
         // tidak butuh token valid — Bot::new tak melakukan network call
         WebCtx::new(&cfg, teloxide::Bot::new("1:test"))

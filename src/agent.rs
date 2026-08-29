@@ -55,23 +55,29 @@ impl Agent {
         }
     }
 
-    /// System prompt = soul (Pilar 3) + curated memory (Pilar 5) + waktu sekarang.
-    fn build_system_prompt(&self, facts: &str) -> String {
+    /// System prompt = soul (Pilar 3) + curated memory (Pilar 5) + skills (Pilar 11)
+    /// + waktu sekarang. Skill yang cocok keyword dengan pesan dimuat penuh (skills.rs).
+    fn build_system_prompt(&self, facts: &str, user_text: &str) -> String {
+        let skills_section =
+            crate::skills::section_for_prompt(std::path::Path::new(&self.cfg.skills_dir), user_text);
         format!(
-            "{}\n\n---\n\n## Memory — fakta tentang owner\n{}\n\n## Waktu sekarang\n{} (UTC) — \
+            "{}\n\n---\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \
              owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tools: `create_reminder` \
              (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
              owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
              efektif; command destruktif otomatis minta approval owner via tombol Telegram), \
              `read_file`/`write_file` (hanya dalam workdir yang diizinkan), `web_search` \
              (info terkini dari web), `fetch_url` (isi halaman sebagai markdown), \
-             `generate_image` (buat gambar → dikirim sebagai foto ke owner). Gunakan proaktif \
-             tanpa diminta kalau konteksnya jelas. Untuk pekerjaan teknis: baca file yang \
-             relevan dulu sebelum mengubah apa pun. Untuk pertanyaan yang butuh info terbaru \
-             (versi, harga, berita, error baru): selalu `web_search` dulu — jangan menebak \
-             dari pengetahuan lama.",
+             `generate_image` (buat gambar → dikirim sebagai foto ke owner), `save_skill` \
+             (simpan prosedur non-trivial yang baru dikuasai — lihat aturannya di deskripsi \
+             tool). Gunakan proaktif tanpa diminta kalau konteksnya jelas. Untuk pekerjaan \
+             teknis: baca file yang relevan dulu sebelum mengubah apa pun. Untuk pertanyaan \
+             yang butuh info terbaru (versi, harga, berita, error baru): selalu `web_search` \
+             dulu — jangan menebak dari pengetahuan lama. Setelah menyelesaikan masalah teknis \
+             non-trivial: simpan prosedurnya dengan `save_skill`.",
             soul::load(&self.cfg.soul_path),
             facts,
+            skills_section,
             chrono::Utc::now().to_rfc3339()
         )
     }
@@ -83,7 +89,7 @@ impl Agent {
         context::save_message(&self.pool, chat_id, "user", user_text).await?;
 
         let facts = memory::facts_for_prompt(&self.pool, chat_id).await?;
-        let system = self.build_system_prompt(&facts);
+        let system = self.build_system_prompt(&facts, user_text);
 
         let mut messages: Vec<ApiMessage> = if include_history {
             context::recent_messages(&self.pool, chat_id, self.cfg.n_context)

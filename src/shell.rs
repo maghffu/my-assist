@@ -37,6 +37,8 @@ pub struct ShellCtx {
     pub pool: PgPool,
     /// Root workdir yang diizinkan utk read_file/write_file + cwd default run_command.
     pub roots: Vec<PathBuf>,
+    /// Direktori skills (Pilar 11) — dipakai tool save_skill.
+    pub skills_dir: PathBuf,
     pub cmd_timeout: Duration,
     pub confirm_timeout: Duration,
     /// cwd per chat_id — `cd` efektif antar panggilan.
@@ -52,6 +54,7 @@ impl ShellCtx {
             bot,
             pool,
             roots: cfg.work_roots.clone(),
+            skills_dir: PathBuf::from(&cfg.skills_dir),
             cmd_timeout: Duration::from_secs(cfg.run_cmd_timeout),
             confirm_timeout: Duration::from_secs(cfg.confirm_timeout),
             cwds: Mutex::new(HashMap::new()),

@@ -1,5 +1,5 @@
 use crate::agent::Agent;
-use crate::{memory, reminders, shell};
+use crate::{memory, reminders, review, shell, skills};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,8 @@ Chat langsung aja — aku inget konteks & fakta penting tentang kamu.\n\
 /status — uptime, provider, model\n\
 /memory — lihat fakta yang kupelajari (/memory del <id> untuk hapus)\n\
 /reminders — daftar pengingat (/reminders del <id> untuk hapus)\n\
+/skills — library skill prosedural\n\
+/dream — jalankan konsolidasi memory+skills sekarang\n\
 /provider — info AI provider aktif\n\
 /usage — pemakaian token proses ini\n\
 /help — tulisan ini";
@@ -28,7 +30,8 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         BotCommand::new("reminders", "daftar pengingat (/reminders del <id>)"),
         BotCommand::new("provider", "info AI provider aktif"),
         BotCommand::new("usage", "pemakaian token proses ini"),
-        BotCommand::new("skills", "daftar skill (Fase 6)"),
+        BotCommand::new("skills", "library skill prosedural"),
+        BotCommand::new("dream", "konsolidasi memory+skills sekarang"),
     ];
     if let Err(e) = bot.set_my_commands(menu).await {
         tracing::warn!("gagal sinkron daftar command: {:#}", e);
@@ -44,6 +47,27 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
                 interval.tick().await;
                 if let Err(e) = process_due_reminders(&bot, &agent).await {
                     tracing::error!("reminder loop error: {:#}", e);
+                }
+            }
+        });
+    }
+
+    // Dreaming cycle — berkala mingguan (Pilar 6). First tick dijadwalkan +7 hari,
+    // BUKAN immediately (tokio interval default nembak langsung — boros token).
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let period = Duration::from_secs(7 * 24 * 3600);
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + period,
+                period,
+            );
+            loop {
+                interval.tick().await;
+                tracing::info!("dreaming cycle mingguan terpicu");
+                match review::run_dream(&agent).await {
+                    Ok(_) => {} // ringkasan sudah di-log run_dream
+                    Err(e) => tracing::error!("dreaming cycle error: {e:#}"),
                 }
             }
         });
@@ -157,7 +181,11 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()>
     };
 
     match outcome {
-        Ok(reply) => send_long(&bot, msg.chat.id, &reply).await?,
+        Ok(reply) => {
+            // Background review pasca-turn (Pilar 6): fire-and-forget, tanpa latency.
+            review::spawn_post_turn_review(agent.clone(), chat_id, text.clone(), reply.clone());
+            send_long(&bot, msg.chat.id, &reply).await?;
+        }
         Err(e) => {
             tracing::error!(chat_id, "turn error: {:#}", e);
             let msg_text: String = e.to_string().chars().take(500).collect();
@@ -269,7 +297,34 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
             ))
         }
 
-        "/skills" => Ok("📚 Skills belum diimplementasikan (ROADMAP Fase 6).".into()),
+        "/skills" => {
+            let dir = std::path::Path::new(&agent.cfg.skills_dir);
+            let metas = skills::list_skills(dir);
+            if metas.is_empty() {
+                return Ok(
+                    "📚 Belum ada skill — terisi otomatis saat agent menyelesaikan masalah \
+                     non-trivial (bisa juga minta dia simpan manual)."
+                        .into(),
+                );
+            }
+            let body = metas
+                .iter()
+                .map(|s| format!("- {} ({} KB)", s.name, (s.bytes + 1023) / 1024))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "📚 **Skills** ({} file, di `{}`):\n{}",
+                metas.len(),
+                agent.cfg.skills_dir,
+                body
+            ))
+        }
+
+        "/dream" => {
+            // Konsolidasi manual (loop mingguan jalan otomatis; ini utk test/darurat)
+            let summary = review::run_dream(agent).await?;
+            Ok(format!("💤 Dream selesai:\n{}", summary))
+        }
 
         other => Ok(format!(
             "Perintah {} tidak dikenal — ketik /help.",

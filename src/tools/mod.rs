@@ -170,6 +170,30 @@ pub fn definitions() -> Vec<ToolDef> {
                 "required": ["prompt"]
             }),
         },
+        ToolDef {
+            name: "save_skill".into(),
+            description: "Simpan prosedur yang BARU saja kamu kuasai/ketahui sebagai skill \
+                (file markdown). Panggil HANYA setelah menyelesaikan masalah NON-TRIVIAL yang \
+                mungkin dihadapi lagi: setup server, troubleshooting, konfigurasi, workaround \
+                error, alur deploy. Isi: langkah bernomor, command yang TERBUKTI jalan (salin \
+                persis), dan gotchas. JANGAN simpan: jawaban FAQ, one-liner, pengetahuan umum \
+                yang bisa dicari ulang — itu bukan skill."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nama pendek deskriptif, kebab-case, mis: renew-ssl-nginx"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Isi skill: langkah, command, gotchas (markdown)"
+                    }
+                },
+                "required": ["name", "content"]
+            }),
+        },
     ]
 }
 
@@ -268,6 +292,14 @@ pub async fn execute(
                 bail!("parameter 'prompt' wajib diisi");
             }
             web.generate_image(chat_id, &prompt).await
+        }
+        "save_skill" => {
+            let name = input["name"].as_str().unwrap_or("").trim().to_string();
+            let content = input["content"].as_str().unwrap_or("").trim().to_string();
+            if name.is_empty() || content.is_empty() {
+                bail!("parameter 'name' dan 'content' wajib diisi");
+            }
+            crate::skills::save_skill(&shell.skills_dir, &name, &content)
         }
         other => bail!("tool tidak dikenal: {}", other),
     }

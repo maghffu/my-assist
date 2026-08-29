@@ -6,7 +6,9 @@ mod gateway;
 mod memory;
 mod provider;
 mod reminders;
+mod review;
 mod shell;
+mod skills;
 mod soul;
 mod tools;
 mod web;
@@ -36,6 +38,7 @@ async fn main() -> Result<()> {
     let cfg = config::Config::from_env()?;
     let pool = db::init_pool(&cfg.database_url).await?;
     db::run_migrations(&pool).await?;
+    skills::ensure_dir(std::path::Path::new(&cfg.skills_dir))?;
 
     let ai = provider::build(&cfg)?;
     // Bot & ShellCtx/WebCtx dibuat sebelum Agent: keduanya memegang bot (utk kirim file,

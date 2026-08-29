@@ -61,6 +61,39 @@ pub async fn delete_fact(pool: &PgPool, chat_id: i64, id: i64) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
+/// Chat id yang punya memory — dipakai dreaming cycle (iterasi per chat, Pilar 6).
+pub async fn distinct_chat_ids(pool: &PgPool) -> Result<Vec<i64>> {
+    let rows = sqlx::query_as::<_, (i64,)>("SELECT DISTINCT chat_id FROM memory")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// Tulis ulang teks fakta (dreaming: merge/rewrite) — id harus milik chat tsb.
+pub async fn update_fact(pool: &PgPool, chat_id: i64, id: i64, fact: &str) -> Result<bool> {
+    let res = sqlx::query("UPDATE memory SET fact = $3 WHERE id = $1 AND chat_id = $2")
+        .bind(id)
+        .bind(chat_id)
+        .bind(fact)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Ubah tipe fakta (dreaming: upgrade inferred → explicit, Pilar 6).
+pub async fn set_fact_type(pool: &PgPool, chat_id: i64, id: i64, fact_type: &str) -> Result<bool> {
+    if !matches!(fact_type, "explicit" | "inferred") {
+        anyhow::bail!("fact_type tidak valid: {fact_type}");
+    }
+    let res = sqlx::query("UPDATE memory SET type = $3 WHERE id = $1 AND chat_id = $2")
+        .bind(id)
+        .bind(chat_id)
+        .bind(fact_type)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Daftar fakta untuk disuntik ke system prompt (terlama dulu — kronologis).
 pub async fn facts_for_prompt(pool: &PgPool, chat_id: i64) -> Result<String> {
     let facts = list_facts(pool, chat_id, 200).await?;

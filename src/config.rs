@@ -32,6 +32,8 @@ pub struct Config {
     pub fetch_timeout: u64,
     /// Timeout generate_image (detik) — generasi gambar bisa lambat.
     pub image_timeout: u64,
+    /// Direktori skills (Pilar 11) — file markdown, satu file per skill.
+    pub skills_dir: String,
 }
 
 impl Config {
@@ -110,6 +112,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            skills_dir: env::var("SKILLS_DIR").unwrap_or_else(|_| "skills".into()),
         })
     }
 }
