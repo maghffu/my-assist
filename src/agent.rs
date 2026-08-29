@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::context;
 use crate::memory;
 use crate::provider::{ApiMessage, AiProvider, ContentBlock};
+use crate::shell::ShellCtx;
 use crate::soul;
 use crate::tools;
 use anyhow::Result;
@@ -25,17 +26,20 @@ pub struct Agent {
     pub pool: PgPool,
     pub provider: Arc<dyn AiProvider>,
     pub cfg: Config,
+    /// State shell access (cwd per chat, pending confirmation, bot handle) — Pilar 9.
+    pub shell: Arc<ShellCtx>,
     /// Token usage in-memory per proses (persist menyusul kalau terbukti perlu — ROADMAP).
     pub usage: Arc<Mutex<UsageAcc>>,
     pub started: Instant,
 }
 
 impl Agent {
-    pub fn new(pool: PgPool, provider: Arc<dyn AiProvider>, cfg: Config) -> Self {
+    pub fn new(pool: PgPool, provider: Arc<dyn AiProvider>, cfg: Config, shell: Arc<ShellCtx>) -> Self {
         Self {
             pool,
             provider,
             cfg,
+            shell,
             usage: Arc::new(Mutex::new(UsageAcc::default())),
             started: Instant::now(),
         }
@@ -45,9 +49,13 @@ impl Agent {
     fn build_system_prompt(&self, facts: &str) -> String {
         format!(
             "{}\n\n---\n\n## Memory — fakta tentang owner\n{}\n\n## Waktu sekarang\n{} (UTC) — \
-             owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tool `create_reminder` \
-             (pengingat / tugas terjadwal / rutinitas berulang) dan `save_memory` (simpan fakta \
-             penting tentang owner). Gunakan proaktif tanpa diminta kalau konteksnya jelas.",
+             owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tools: `create_reminder` \
+             (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
+             owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
+             efektif; command destruktif otomatis minta approval owner via tombol Telegram), \
+             `read_file`/`write_file` (hanya dalam workdir yang diizinkan). Gunakan proaktif \
+             tanpa diminta kalau konteksnya jelas. Untuk pekerjaan teknis: baca file yang \
+             relevan dulu sebelum mengubah apa pun.",
             soul::load(&self.cfg.soul_path),
             facts,
             chrono::Utc::now().to_rfc3339()
@@ -132,7 +140,7 @@ impl Agent {
             // Eksekusi semua tool call, kirim hasilnya sebagai tool_result
             let mut results = Vec::new();
             for (id, name, input) in tool_uses {
-                let out = match tools::execute(&self.pool, chat_id, &name, &input).await {
+                let out = match tools::execute(&self.shell, chat_id, &name, &input).await {
                     Ok(s) => s,
                     Err(e) => format!("❌ tool error: {:#}", e),
                 };

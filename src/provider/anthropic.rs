@@ -3,20 +3,21 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 4096;
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
+    api_url: String,
     api_key: String,
     model: String,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(base_url: String, api_key: String, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
+            api_url: format!("{}/v1/messages", base_url.trim_end_matches('/')),
             api_key,
             model,
         }
@@ -68,7 +69,7 @@ impl AiProvider for AnthropicProvider {
 
         let http = self
             .client
-            .post(API_URL)
+            .post(&self.api_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)

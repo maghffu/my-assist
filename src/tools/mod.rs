@@ -1,9 +1,9 @@
 use crate::memory;
 use crate::provider::ToolDef;
 use crate::reminders;
+use crate::shell::ShellCtx;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use sqlx::PgPool;
 
 /// Definisi tools yang diekspos ke LLM (Fase 2: reminder + memory;
 /// Fase 4+ menambah run_command/read_file/write_file, web, skills, image — lihat ROADMAP).
@@ -64,11 +64,62 @@ pub fn definitions() -> Vec<ToolDef> {
                 "required": ["fact"]
             }),
         },
+        ToolDef {
+            name: "run_command".into(),
+            description: "Jalankan shell command di VPS server ini (bash). Working directory \
+                diingat antar panggilan — `cd` efektif untuk command berikutnya. Command biasa \
+                langsung dieksekusi; command destruktif (rm -rf, dd, reboot, curl|sh, dst.) \
+                otomatis minta approval owner via tombol Telegram. Timeout eksekusi 120 detik; \
+                command interaktif (perlu input stdin) tidak didukung. Output panjang otomatis \
+                dikirim sebagai file ke owner."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command bash lengkap (bisa satu baris dengan && atau ;)"
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDef {
+            name: "read_file".into(),
+            description: "Baca isi file dari disk. Path absolut, atau relatif terhadap \
+                workdir utama. Hanya di dalam direktori yang diizinkan. File besar otomatis \
+                dikirim sebagai file ke owner. Lebih hemat & aman daripada cat via shell."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path file (absolut atau relatif workdir)" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDef {
+            name: "write_file".into(),
+            description: "Tulis (overwrite penuh) isi file. Direktori dibuat otomatis kalau \
+                belum ada. Hanya di dalam direktori yang diizinkan. Maksimum ~100KB per call — \
+                untuk perubahan besar, pecah jadi beberapa call. Lebih aman daripada echo/heredoc \
+                via shell."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path file tujuan" },
+                    "content": { "type": "string", "description": "Isi file lengkap" }
+                },
+                "required": ["path", "content"]
+            }),
+        },
     ]
 }
 
 /// Eksekusi tool call dari LLM. Return string hasil yang dikirim balik sebagai tool_result.
-pub async fn execute(pool: &PgPool, chat_id: i64, name: &str, input: &Value) -> Result<String> {
+pub async fn execute(shell: &ShellCtx, chat_id: i64, name: &str, input: &Value) -> Result<String> {
+    let pool = &shell.pool;
     match name {
         "create_reminder" => {
             let message = input["message"].as_str().unwrap_or("").trim().to_string();
@@ -111,6 +162,28 @@ pub async fn execute(pool: &PgPool, chat_id: i64, name: &str, input: &Value) -> 
                 _ => "explicit",
             };
             memory::save_fact(pool, chat_id, &fact, fact_type).await
+        }
+        "run_command" => {
+            let command = input["command"].as_str().unwrap_or("").trim().to_string();
+            if command.is_empty() {
+                bail!("parameter 'command' wajib diisi");
+            }
+            shell.run_command(chat_id, &command).await
+        }
+        "read_file" => {
+            let path = input["path"].as_str().unwrap_or("").trim().to_string();
+            if path.is_empty() {
+                bail!("parameter 'path' wajib diisi");
+            }
+            shell.read_file(chat_id, &path).await
+        }
+        "write_file" => {
+            let path = input["path"].as_str().unwrap_or("").trim().to_string();
+            let content = input["content"].as_str().unwrap_or("").to_string();
+            if path.is_empty() {
+                bail!("parameter 'path' wajib diisi");
+            }
+            shell.write_file(chat_id, &path, &content).await
         }
         other => bail!("tool tidak dikenal: {}", other),
     }

@@ -6,6 +6,7 @@ mod gateway;
 mod memory;
 mod provider;
 mod reminders;
+mod shell;
 mod soul;
 mod tools;
 
@@ -36,9 +37,12 @@ async fn main() -> Result<()> {
     db::run_migrations(&pool).await?;
 
     let ai = provider::build(&cfg)?;
-    let agent = Arc::new(agent::Agent::new(pool, ai, cfg));
+    // Bot & ShellCtx dibuat sebelum Agent: ShellCtx memegang bot (utk kirim keyboard
+    // konfirmasi & file output) dan Agent memegang ShellCtx (Pilar 9).
+    let bot = teloxide::Bot::new(cfg.telegram_bot_token.clone());
+    let shell = shell::ShellCtx::new(&cfg, bot.clone(), pool.clone());
+    let agent = Arc::new(agent::Agent::new(pool, ai, cfg, shell));
 
-    let bot = teloxide::Bot::new(agent.cfg.telegram_bot_token.clone());
     tracing::info!(
         provider = agent.provider.name(),
         model = agent.provider.model_name(),

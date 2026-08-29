@@ -18,6 +18,14 @@ pub enum ContentBlock {
     ToolUse { id: String, name: String, input: Value },
     #[serde(rename = "tool_result")]
     ToolResult { tool_use_id: String, content: String },
+    /// Blok reasoning model (GLM dan extended-thinking Anthropic) — tidak ditampilkan
+    /// ke user; dikirim balik apa adanya (signature wajib utk beberapa provider).
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -63,6 +71,7 @@ pub trait AiProvider: Send + Sync {
 pub fn build(cfg: &Config) -> Result<Arc<dyn AiProvider>> {
     match cfg.ai_provider.as_str() {
         "anthropic" => Ok(Arc::new(anthropic::AnthropicProvider::new(
+            cfg.anthropic_base_url.clone(),
             cfg.anthropic_api_key.clone(),
             cfg.anthropic_model.clone(),
         ))),

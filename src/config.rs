@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::path::PathBuf;
 
 /// Konfigurasi runtime — semua via env var (Pilar 8: provider via config, bukan kode).
 #[derive(Clone, Debug)]
@@ -8,12 +9,21 @@ pub struct Config {
     pub database_url: String,
     pub anthropic_api_key: String,
     pub anthropic_model: String,
+    /// Base URL provider — default api.anthropic.com; bisa diganti ke endpoint
+    /// Anthropic-compatible milik provider lain (mis. GLM: open.bigmodel.cn/api/anthropic).
+    pub anthropic_base_url: String,
     pub ai_provider: String,
     /// Hard allowlist chat id (Pilar 9 keamanan #1) — pesan dari luar ini di-drop total.
     pub allowed_chat_ids: Vec<i64>,
     /// N pesan terakhir sebagai context (Pilar 2) — jangan kirim full history.
     pub n_context: i64,
     pub soul_path: String,
+    /// Root workdir utk read_file/write_file + cwd default run_command (Pilar 9).
+    pub work_roots: Vec<PathBuf>,
+    /// Timeout eksekusi per shell command (detik).
+    pub run_cmd_timeout: u64,
+    /// Timeout menunggu approval destructive command (detik).
+    pub confirm_timeout: u64,
 }
 
 impl Config {
@@ -42,6 +52,10 @@ impl Config {
             anthropic_api_key,
             anthropic_model: env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+            anthropic_base_url: env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".into())
+                .trim_end_matches('/')
+                .to_string(),
             ai_provider: env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".into()),
             allowed_chat_ids,
             n_context: env::var("N_CONTEXT")
@@ -49,6 +63,30 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20),
             soul_path: env::var("SOUL_PATH").unwrap_or_else(|_| "soul.md".into()),
+            work_roots: env::var("WORK_ROOTS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim())
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+                })
+                .into_iter()
+                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                .collect(),
+            run_cmd_timeout: env::var("RUN_CMD_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            confirm_timeout: env::var("CONFIRM_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         })
     }
 }

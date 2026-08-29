@@ -16,3 +16,7 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+# killpg utk kill process group pada timeout run_command (Pilar 9)
+nix = { version = "0.29", features = ["signal"] }

@@ -1,10 +1,10 @@
 use crate::agent::Agent;
-use crate::{memory, reminders};
+use crate::{memory, reminders, shell};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId};
+use teloxide::types::{BotCommand, CallbackQuery, ChatAction, ChatId};
 
 const HELP_TEXT: &str = "🤖 **Hermes-Lite**\n\
 \n\
@@ -19,6 +19,21 @@ Chat langsung aja — aku inget konteks & fakta penting tentang kamu.\n\
 /help — tulisan ini";
 
 pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
+    // Sinkron daftar command di menu "/" Telegram — token bot bisa dipakai ulang dari
+    // aplikasi lain, jadi daftar lama (warisan) dioverwrite total saat startup.
+    let menu = vec![
+        BotCommand::new("help", "bantuan / daftar perintah"),
+        BotCommand::new("status", "uptime, provider, model"),
+        BotCommand::new("memory", "fakta yang dipelajari (/memory del <id>)"),
+        BotCommand::new("reminders", "daftar pengingat (/reminders del <id>)"),
+        BotCommand::new("provider", "info AI provider aktif"),
+        BotCommand::new("usage", "pemakaian token proses ini"),
+        BotCommand::new("skills", "daftar skill (Fase 6)"),
+    ];
+    if let Err(e) = bot.set_my_commands(menu).await {
+        tracing::warn!("gagal sinkron daftar command: {:#}", e);
+    }
+
     // Reminder trigger loop — polling tiap 30 detik (Pilar 4)
     {
         let bot = bot.clone();
@@ -34,18 +49,81 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         });
     }
 
-    let handler_agent = agent.clone();
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let agent = handler_agent.clone();
-        async move {
-            if let Err(e) = handle_message(bot, msg, agent).await {
-                tracing::error!("message handler error: {:#}", e);
+    // Dispatcher dua jalur: pesan (chat/slash command) + callback query
+    // (tombol Approve/Deny confirmation gate run_command — Pilar 9 keamanan #3).
+    let msg_agent = agent.clone();
+    let cb_agent = agent.clone();
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
+            let agent = msg_agent.clone();
+            async move {
+                if let Err(e) = handle_message(bot.clone(), msg, agent).await {
+                    tracing::error!("message handler error: {:#}", e);
+                }
+                respond(())
             }
-            Ok(())
-        }
-    })
-    .await;
+        }))
+        .branch(
+            Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
+                let agent = cb_agent.clone();
+                async move {
+                    if let Err(e) = handle_callback(bot.clone(), q, agent).await {
+                        tracing::error!("callback handler error: {:#}", e);
+                    }
+                    respond(())
+                }
+            }),
+        );
 
+    Dispatcher::builder(bot, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+
+    Ok(())
+}
+
+/// Handler tombol konfirmasi destructive command: "hmc:<id>:ok|no" (Pilar 9).
+/// Ambil oneshot sender yang menunggu di ShellCtx, kirim verdict, beri feedback visual.
+async fn handle_callback(bot: Bot, q: CallbackQuery, agent: Arc<Agent>) -> Result<()> {
+    // Keyboard konfirmasi selalu ada di chat owner; chat di luar allowlist di-drop.
+    let Some(msg) = q.message.as_ref() else {
+        let _ = bot.answer_callback_query(&q.id).await;
+        return Ok(());
+    };
+    if !agent.cfg.allowed_chat_ids.contains(&msg.chat().id.0) {
+        tracing::warn!(chat = %msg.chat().id.0, "callback dari chat di luar allowlist — di-drop");
+        return Ok(());
+    }
+
+    match q.data.as_deref().and_then(shell::parse_confirm) {
+        Some((id, verdict)) => match agent.shell.take_pending(id) {
+            Some(sender) => {
+                // Kirim verdict ke run_command yang sedang menunggu (oneshot).
+                let _ = sender.send(verdict);
+                let text = if verdict {
+                    "✅ Approved — melanjutkan eksekusi…"
+                } else {
+                    "❌ Denied — perintah dibatalkan."
+                };
+                let _ = bot
+                    .edit_message_text(msg.chat().id, msg.id(), text)
+                    .await;
+                let _ = bot.answer_callback_query(&q.id).await;
+            }
+            None => {
+                // Sudah dijawab / timeout — hentikan spinner tombol saja.
+                let _ = bot
+                    .answer_callback_query(&q.id)
+                    .text("⏰ Konfirmasi sudah kedaluwarsa.")
+                    .await;
+            }
+        },
+        None => {
+            let _ = bot.answer_callback_query(&q.id).await;
+        }
+    }
     Ok(())
 }
 

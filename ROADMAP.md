@@ -14,13 +14,15 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 | 1 | Provider layer: trait + Anthropic | ✅ selesai |
 | 2 | Agent loop + tools inti (reminder, memory) | ✅ selesai |
 | 3 | Telegram gateway: polling, allowlist, slash commands | ✅ selesai |
-| 4 | Shell access (`run_command`, file tools, confirmation) | ⬜ |
+| 4 | Shell access (`run_command`, file tools, confirmation) | ✅ selesai |
 | 5 | Web search, fetch_url chain, image generation | ⬜ |
 | 6 | Memory depth: background review, dreaming, skills | ⬜ |
 | 7 | OCR (Tesseract) | ⬜ |
 | 8 | Hardening & deploy VPS | ⬜ |
 
 **Status verifikasi Fase 0–3 (2026-08-29):** `cargo build` hijau ✅ · binary jalan + validasi config graceful ✅ · migrasi belum bisa dites lokal (PostgreSQL portable diblokir endpoint security mesin dev — exception `0xC0000142` pada child process; detail di bawah) — migrasi akan tervalidasi saat dijalankan di VPS.
+
+**Status verifikasi Fase 4 (2026-08-29, mesin Linux/VPS):** `cargo build` hijau ✅ · `cargo test` 4/4 lulus (destructive detection, masking, cwd marker, confirm parsing) ✅ · migrasi tervalidasi via `hermes-lite migrate` (Postgres 17 docker, 4 tabel + `_sqlx_migrations`) ✅ · bot live long polling dengan wiring shell + callback handler confirmation gate ✅ · smoke test mekanik wrapper bash + marker cwd ✅. End-to-end `run_command` via Telegram menyusul diuji owner (perlu tap approve di keyboard konfirmasi).
 
 ### Terverifikasi berjalan di mesin dev
 
