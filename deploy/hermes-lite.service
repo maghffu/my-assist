@@ -6,6 +6,8 @@
 # - ProtectSystem=strict: seluruh FS read-only KECUALI /opt/hermes-lite (skills,
 #   write_file) dan /tmp (PrivateTmp — per-service, tak terlihat proses lain)
 # - bash -l utk run_command tetap jalan (read /etc/profile cukup, non-interaktif)
+# - Vault Obsidian owner (/opt/vault + bare repo /opt/vault.git) — owner akses via
+#   SSH laptop lewat symlink /root/vault; agent edit wajib commit+push (Pilar 11 style)
 
 [Unit]
 Description=Hermes-Lite — personal AI agent (Telegram)
@@ -29,7 +31,7 @@ LimitNOFILE=65536
 # Sandbox
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/hermes-lite /tmp
+ReadWritePaths=/opt/hermes-lite /tmp /opt/vault /opt/vault.git
 PrivateTmp=true
 ProtectHome=true
 ProtectKernelTunables=true

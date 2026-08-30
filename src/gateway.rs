@@ -1,6 +1,7 @@
 use crate::agent::Agent;
 use crate::{memory, ocr, reminders, review, shell, skills};
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -391,14 +392,23 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
 }
 
 /// Reminder loop: kirim static reminder / eksekusi job / reschedule recurring (Pilar 4).
+///
+/// Bugfix retry-forever: kalau pengiriman gagal (mis. AI rate-limit/auth error),
+/// TIDAK lagi `continue` tanpa tindakan (yang membuat remind_at tertinggal di masa
+/// lalu & retry tiap 30 detik membabi buta). Sekarang gagal memicu backoff
+/// eksponensial via `bump_fail`, sehingga job/reminder tetap bisa dicoba lagi tapi
+/// intervalnya makin jarang, dan one-shot menyerah setelah kumulatif > 24 jam.
 async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
     for r in reminders::due_now(&agent.pool).await? {
         tracing::info!(reminder_id = r.id, kind = %r.kind, "firing reminder");
 
+        let original_remind_at = r.remind_at;
         let outcome: Result<()> = async {
             match r.kind.as_str() {
                 "job" => {
-                    // Job: agent mengeksekusi instruksi dengan context segar (Pilar 4)
+                    // Job: agent mengeksekusi instruksi dengan context segar (Pilar 4).
+                    // Konvensi job prompt: balas "SKIP" = tidak ada yang perlu
+                    // dikirim (mis. hari rest) — diam, tanpa spam ke owner.
                     let out = agent
                         .run_turn(
                             r.chat_id,
@@ -406,8 +416,12 @@ async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
                             false,
                         )
                         .await?;
-                    send_long(bot, ChatId(r.chat_id), &format!("⚙️ Job selesai:\n{}", out))
-                        .await?;
+                    if out.trim().eq_ignore_ascii_case("skip") {
+                        tracing::info!(reminder_id = r.id, "job SKIP — tidak ada output utk owner");
+                    } else {
+                        send_long(bot, ChatId(r.chat_id), &format!("⚙️ Job selesai:\n{}", out))
+                            .await?;
+                    }
                 }
                 _ => {
                     bot.send_message(ChatId(r.chat_id), format!("⏰ {}", r.message))
@@ -419,20 +433,41 @@ async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
         .await;
 
         match outcome {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::error!(reminder_id = r.id, "reminder gagal dikirim: {:#}", e);
-                continue; // jangan mark sent kalau gagal — coba lagi tick berikutnya
+            Ok(()) => {
+                reminders::reset_fail(&agent.pool, r.id).await?;
+                // Reschedule dari jadwal asli (bukan remind_at yang sudah mundur
+                // akibat backoff) biar siklus recurring tetap konsisten.
+                match r
+                    .recur
+                    .as_deref()
+                    .and_then(|rec| reminders::compute_next_run(rec, original_remind_at))
+                {
+                    Some(next) => reminders::reschedule(&agent.pool, r.id, next).await?,
+                    None => reminders::mark_sent(&agent.pool, r.id).await?,
+                }
             }
-        }
-
-        match r
-            .recur
-            .as_deref()
-            .and_then(|rec| reminders::compute_next_run(rec, r.remind_at))
-        {
-            Some(next) => reminders::reschedule(&agent.pool, r.id, next).await?,
-            None => reminders::mark_sent(&agent.pool, r.id).await?,
+            Err(e) => {
+                tracing::error!(
+                    reminder_id = r.id,
+                    fail = r.fail_count.saturating_add(1),
+                    "reminder gagal dikirim: {:#}",
+                    e
+                );
+                // Backoff — JANGAN coba lagi tiap 30 detik (bug retry-forever).
+                let new_fail =
+                    reminders::bump_fail(&agent.pool, r.id, Utc::now(), r.fail_count).await?;
+                // One-shot yang sudah gagal berkali-kali (kumulatif backoff > 24 jam):
+                // menyerah & tandai sent supaya tidak selamanya dipukul oleh loop.
+                if r.recur.is_none()
+                    && reminders::cumulative_backoff_secs(new_fail) > reminders::GIVEUP_AFTER_SECS
+                {
+                    reminders::mark_sent(&agent.pool, r.id).await?;
+                    tracing::warn!(
+                        reminder_id = r.id,
+                        "one-shot reminder menyerah setelah backoff berkali-kali"
+                    );
+                }
+            }
         }
     }
     Ok(())
