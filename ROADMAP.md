@@ -19,6 +19,7 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 | 6 | Memory depth: background review, dreaming, skills | ✅ selesai |
 | 7 | OCR (Tesseract) | ✅ selesai |
 | 8 | Hardening & deploy VPS | ✅ selesai |
+| 9 | UX & reliability: progress notifier, provider timeout+retry, confirm 3-tombol | ✅ selesai |
 
 **Status verifikasi Fase 0–3 (2026-08-29):** `cargo build` hijau ✅ · binary jalan + validasi config graceful ✅ · migrasi belum bisa dites lokal (PostgreSQL portable diblokir endpoint security mesin dev — exception `0xC0000142` pada child process; detail di bawah) — migrasi akan tervalidasi saat dijalankan di VPS.
 
@@ -168,3 +169,37 @@ DATABASE_URL=postgres://... cargo run -- migrate
 export DATABASE_URL=postgres://hermes:***@localhost:5432/hermes
 cargo run -- migrate    # atau langsung cargo run (auto-migrate)
 ```
+
+## Fase 9 — UX & Reliability (2026-08-30)
+
+Keluhan owner pasca-pemakaian nyata (dibanding Hermes Agent Nous Research):
+uninstall package "tidak bisa", kadang tidak ada balasan sama sekali ("ngomong
+sama tembok"), tidak ada pesan progres saat agent bekerja, tombol konfirmasi
+kurang lengkap, kendala tidak pernah dilaporkan.
+
+**Akar masalah yang ditemukan:**
+- `reqwest::Client::new()` di provider TANPA timeout — API hang = turn diam selamanya
+- Pesan non-teks (dokumen/voice/sticker) di-drop diam tanpa kabar
+- `MAX_TOOL_ITERATIONS=8` kurang untuk task multi-langkah (uninstall = cek → remove → verifikasi)
+- Stop `max_tokens`/`tool_use` tidak dilaporkan — owner cuma lihat "(tidak ada respons teks)"
+- Typing indicator dikirim 1x (Telegram hapus setelah ±5 detik) — turn panjang tampak mati
+
+**Deliverable:**
+- `src/notify.rs` (baru) — Notifier: satu pesan status live per turn (di-edit,
+  lazy — chat tanpa tool tidak berisik): tiap tool call tampil `🔧 mulai →
+  ✅/⚠️ selesai + durasi`; typing indicator loop tiap 4 detik; fire-and-forget
+  (tanpa latency tambahan); `finish()` hapus status saat sukses / edit ❌ saat gagal
+- `provider/anthropic.rs` — HTTP timeout 240s + connect 15s, retry 3x backoff
+  kuadrat untuk 429/5xx/timeout koneksi, `MAX_TOKENS` 4096→8192
+- `shell.rs` — confirmation gate 3 tombol: ✅ Jalankan sekali / 🔁 Sesi ini
+  (exact-command allowlist sampai restart) / ❌ Tolak; pesan konfirmasi
+  menyertakan alasan (`destructive_reason`); `CONFIRM_TIMEOUT` default 300→600
+- `agent.rs` — `run_turn` menerima `Notifier`; `MAX_TOOL_ITERATIONS` 8→16;
+  stop_reason `max_tokens`/`tool_use` dilaporkan dengan saran tindakan; system
+  prompt: kerjakan tugas sistem langsung, kendala dijelaskan, jangan pernah diam
+- `gateway.rs` — turn timeout 900s sebagai pagar terakhir (owner selalu dapat
+  kabar walau semuanya hang); tipe pesan tak didukung dibalas penjelasan; error
+  ditampilkan dengan akar penyebab (`root_cause`) + saran; job reminder pakai Notifier
+
+**Kriteria selesai:** `cargo build` + `cargo test` hijau; verifikasi live via
+Telegram menyusul diuji owner.

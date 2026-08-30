@@ -4,13 +4,13 @@
 //! (biar `cd` efektif antar panggilan), timeout + kill process group, output
 //! panjang jadi file attachment, audit ke `command_logs`, secret masking.
 //!
-//! Keamanan: destructive pattern → confirmation gate inline keyboard (owner
-//! tap approve/deny), tool menunggu via oneshot channel dengan timeout.
+//! Keamanan: command berisiko → confirmation gate 3 tombol (✅ sekali / 🔁 sesi
+//! ini / ❌ tolak), tool menunggu via oneshot channel dengan timeout.
 
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,18 @@ use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputF
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::oneshot;
+
+/// Verdict owner atas confirmation gate (Pilar 9 keamanan #3) — 3 pilihan,
+/// setara Hermes Agent: approve sekali / approve selama sesi / tolak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmVerdict {
+    /// Approve sekali — command ini jalan 1x, berikutnya ditanya lagi.
+    Allow,
+    /// Approve sesi ini — command yang sama persis tidak ditanya lagi sampai restart.
+    Always,
+    /// Tolak — command dibatalkan.
+    Deny,
+}
 
 /// Tool result ke LLM: tail sebanyak ini (AGENTS.md Pilar 9 — truncation dengan tail).
 const MAX_CTX_CHARS: usize = 2000;
@@ -44,7 +56,10 @@ pub struct ShellCtx {
     /// cwd per chat_id — `cd` efektif antar panggilan.
     cwds: Mutex<HashMap<i64, PathBuf>>,
     /// Konfirmasi destructive command yang pending: id → sender verdict.
-    pending: Mutex<HashMap<u32, oneshot::Sender<bool>>>,
+    pending: Mutex<HashMap<u32, oneshot::Sender<ConfirmVerdict>>>,
+    /// Command yang owner approve "sesi ini" (exact-match, hilang saat restart) —
+    /// hasil tombol 🔁 biar task multi-langkah tidak ditanya berulang-ulang.
+    session_allow: Mutex<HashSet<String>>,
     next_id: AtomicU32,
 }
 
@@ -59,6 +74,7 @@ impl ShellCtx {
             confirm_timeout: Duration::from_secs(cfg.confirm_timeout),
             cwds: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            session_allow: Mutex::new(HashSet::new()),
             next_id: AtomicU32::new(1),
         })
     }
@@ -77,24 +93,28 @@ impl ShellCtx {
             })
     }
 
-    /// Kirim keyboard approve/deny, lalu tunggu verdict owner (oneshot + timeout).
-    /// Return false kalau denied / timeout / channel drop.
-    async fn request_confirmation(&self, chat_id: i64, cmd: &str) -> bool {
+    /// Kirim keyboard 3-tombol (sekali / sesi ini / tolak), lalu tunggu verdict
+    /// owner (oneshot + timeout). Timeout / channel drop = Deny (err ke sisi aman).
+    async fn request_confirmation(&self, chat_id: i64, cmd: &str, reason: &str) -> ConfirmVerdict {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().unwrap().insert(id, tx);
 
-        let kb = InlineKeyboardMarkup::new([[
-            InlineKeyboardButton::callback("✅ Approve", format!("hmc:{id}:ok")),
-            InlineKeyboardButton::callback("❌ Deny", format!("hmc:{id}:no")),
-        ]]);
+        let kb = InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback("✅ Jalankan sekali", format!("hmc:{id}:ok")),
+                InlineKeyboardButton::callback("🔁 Sesi ini", format!("hmc:{id}:always")),
+            ],
+            vec![InlineKeyboardButton::callback("❌ Tolak", format!("hmc:{id}:no"))],
+        ]);
         let sent = self
             .bot
             .send_message(
                 ChatId(chat_id),
                 format!(
-                    "⚠️ Perintah destruktif — eksekusi sekarang?\n\n$ {}\n\n(approve dalam {} detik)",
-                    cmd,
+                    "⚠️ Perintah berisiko ({reason}) — jalankan sekarang?\n\n$ {cmd}\n\n\
+                     ✅ = sekali ini saja · 🔁 = command sama tak ditanya lagi sesi ini · ❌ = batal\n\
+                     (batas jawab {} detik — lewat waktu otomatis batal)",
                     self.confirm_timeout.as_secs()
                 ),
             )
@@ -107,7 +127,7 @@ impl ShellCtx {
             .await
             .ok()
             .and_then(|r| r.ok())
-            .unwrap_or(false);
+            .unwrap_or(ConfirmVerdict::Deny);
 
         // Masih ada di map = tidak pernah dijawab (timeout) → tandai kedaluwarsa
         if msg_id.is_some() && self.pending.lock().unwrap().remove(&id).is_some() {
@@ -124,7 +144,7 @@ impl ShellCtx {
     }
 
     /// Dipakai callback handler gateway: ambil sender konfirmasi by id.
-    pub fn take_pending(&self, id: u32) -> Option<oneshot::Sender<bool>> {
+    pub fn take_pending(&self, id: u32) -> Option<oneshot::Sender<ConfirmVerdict>> {
         self.pending.lock().unwrap().remove(&id)
     }
 
@@ -135,13 +155,23 @@ impl ShellCtx {
             bail!("parameter 'command' kosong");
         }
 
-        // Confirmation gate destructive pattern (keamanan #3)
-        if is_destructive(cmd) {
-            tracing::warn!(chat_id, cmd, "destructive command — menunggu approval owner");
-            if !self.request_confirmation(chat_id, cmd).await {
-                self.audit(chat_id, &format!("[DIBATALKAN] {cmd}"), None, 0)
-                    .await;
-                return Ok("❌ Dibatalkan — owner tidak menyetujui (atau konfirmasi timeout).".into());
+        // Confirmation gate destructive pattern (keamanan #3) — 3 tombol, dan
+        // command yang sudah di-approve "sesi ini" lewat tanpa ditanya lagi.
+        if let Some(reason) = destructive_reason(cmd) {
+            let already = self.session_allow.lock().unwrap().contains(cmd);
+            if !already {
+                tracing::warn!(chat_id, cmd, reason, "destructive command — menunggu approval owner");
+                match self.request_confirmation(chat_id, cmd, reason).await {
+                    ConfirmVerdict::Allow => {}
+                    ConfirmVerdict::Always => {
+                        self.session_allow.lock().unwrap().insert(cmd.to_string());
+                    }
+                    ConfirmVerdict::Deny => {
+                        self.audit(chat_id, &format!("[DIBATALKAN] {cmd}"), None, 0).await;
+                        return Ok("❌ Owner menolak / konfirmasi kedaluwarsa — command TIDAK dijalankan. \
+                            Jangan ulangi sendiri; laporkan ke owner dan tunggu instruksinya.".into());
+                    }
+                }
             }
         }
 
@@ -384,17 +414,18 @@ impl ShellCtx {
     }
 }
 
-/// Parse callback data keyboard konfirmasi: "hmc:<id>:ok|no".
-pub fn parse_confirm(data: &str) -> Option<(u32, bool)> {
+/// Parse callback data keyboard konfirmasi: "hmc:<id>:ok|always|no".
+pub fn parse_confirm(data: &str) -> Option<(u32, ConfirmVerdict)> {
     let rest = data.strip_prefix("hmc:")?;
     let (id, verdict) = rest.split_once(':')?;
     let id = id.parse().ok()?;
-    let ok = match verdict {
-        "ok" => true,
-        "no" => false,
+    let v = match verdict {
+        "ok" => ConfirmVerdict::Allow,
+        "always" => ConfirmVerdict::Always,
+        "no" => ConfirmVerdict::Deny,
         _ => return None,
     };
-    Some((id, ok))
+    Some((id, v))
 }
 
 /// Baca kedua pipe sampai EOF lalu tunggu exit — dipakai bersama timeout.
@@ -485,9 +516,10 @@ fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Deteksi command destruktif → butuh confirmation gate (keamanan #3).
+/// Deteksi command destruktif + alasan singkatnya — alasan ditampilkan di pesan
+/// konfirmasi supaya owner tahu KENAPA command ini diminta approve.
 /// Heuristik token-based (tanpa dependency regex) — err ke sisi aman.
-pub fn is_destructive(cmd: &str) -> bool {
+pub fn destructive_reason(cmd: &str) -> Option<&'static str> {
     let toks: Vec<&str> = cmd
         .split_whitespace()
         .filter(|t| *t != "sudo" && *t != "&&")
@@ -504,7 +536,7 @@ pub fn is_destructive(cmd: &str) -> bool {
         let has_r = flags.iter().any(|f| f.contains('r') || *f == "recursive");
         let has_f = flags.iter().any(|f| f.contains('f') || *f == "force");
         if has_r && has_f {
-            return true;
+            return Some("hapus rekursif + force (rm -rf)");
         }
     }
 
@@ -517,7 +549,11 @@ pub fn is_destructive(cmd: &str) -> bool {
                 .map(|t| t.trim_start_matches('-'))
                 .collect();
             if flags.iter().any(|f| f.contains('R')) {
-                return true;
+                return Some(if name == "chmod" {
+                    "ubah izin rekursif (chmod -R)"
+                } else {
+                    "ubah owner rekursif (chown -R)"
+                });
             }
         }
     }
@@ -531,13 +567,13 @@ pub fn is_destructive(cmd: &str) -> bool {
         ) || t.starts_with("mkfs.")
     };
     if toks.iter().any(|t| hard(t)) {
-        return true;
+        return Some("command sistem kritis (dd/mkfs/reboot/shred/dll.)");
     }
 
     // init 0 / init 6
     if let Some(i) = toks.iter().position(|t| *t == "init") {
         if matches!(toks.get(i + 1), Some(&"0") | Some(&"6")) {
-            return true;
+            return Some("shutdown/init (init 0/6)");
         }
     }
 
@@ -546,7 +582,7 @@ pub fn is_destructive(cmd: &str) -> bool {
     if ["/dev/sd", "/dev/nvme", "/dev/vd", "/dev/mmcblk"].iter().any(|d| {
         joined.contains(&format!("> {d}")) || joined.contains(&format!("of={d}"))
     }) {
-        return true;
+        return Some("tulis langsung ke block device");
     }
 
     // curl/wget di-pipe ke shell
@@ -554,7 +590,11 @@ pub fn is_destructive(cmd: &str) -> bool {
     let pipe_shell = toks
         .windows(2)
         .any(|w| w[0] == "|" && matches!(w[1], "sh" | "bash" | "zsh" | "dash" | "ksh"));
-    downloads && pipe_shell
+    if downloads && pipe_shell {
+        return Some("download script lalu dieksekusi (curl|sh)");
+    }
+
+    None
 }
 
 /// Secret masking (keamanan #5): nilai env/credential tidak boleh bocor ke Telegram.
@@ -644,30 +684,30 @@ mod tests {
 
     #[test]
     fn destructive_detection() {
-        assert!(is_destructive("rm -rf /tmp/x"));
-        assert!(is_destructive("sudo rm -fr /tmp/x"));
-        assert!(is_destructive("rm -r -f /tmp/x"));
-        assert!(is_destructive("rm --recursive --force /tmp/x"));
-        assert!(is_destructive("docker exec c rm -rf /data"));
-        assert!(is_destructive("dd if=/dev/zero of=/dev/sda"));
-        assert!(is_destructive("mkfs.ext4 /dev/sdb"));
-        assert!(is_destructive("apt update && reboot"));
-        assert!(is_destructive("chmod -R 777 /var/www"));
-        assert!(is_destructive("sudo chown -R www-data: /var"));
-        assert!(is_destructive("curl -fsSL https://x.sh | sh"));
-        assert!(is_destructive("wget -qO- https://x | bash"));
-        assert!(is_destructive("echo hi > /dev/sda"));
-        assert!(is_destructive("systemctl reboot"));
-        assert!(is_destructive("init 6"));
+        assert!(destructive_reason("rm -rf /tmp/x").is_some());
+        assert!(destructive_reason("sudo rm -fr /tmp/x").is_some());
+        assert!(destructive_reason("rm -r -f /tmp/x").is_some());
+        assert!(destructive_reason("rm --recursive --force /tmp/x").is_some());
+        assert!(destructive_reason("docker exec c rm -rf /data").is_some());
+        assert!(destructive_reason("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(destructive_reason("mkfs.ext4 /dev/sdb").is_some());
+        assert!(destructive_reason("apt update && reboot").is_some());
+        assert!(destructive_reason("chmod -R 777 /var/www").is_some());
+        assert!(destructive_reason("sudo chown -R www-data: /var").is_some());
+        assert!(destructive_reason("curl -fsSL https://x.sh | sh").is_some());
+        assert!(destructive_reason("wget -qO- https://x | bash").is_some());
+        assert!(destructive_reason("echo hi > /dev/sda").is_some());
+        assert!(destructive_reason("systemctl reboot").is_some());
+        assert!(destructive_reason("init 6").is_some());
 
-        assert!(!is_destructive("rm file.txt"));
-        assert!(!is_destructive("rm -r build/"));
-        assert!(!is_destructive("chmod +x script.sh"));
-        assert!(!is_destructive("curl -s https://api.example.com/data"));
-        assert!(!is_destructive("ls -la; df -h"));
-        assert!(!is_destructive("grep -r pattern ."));
-        assert!(!is_destructive("docker rm -f webapp"));
-        assert!(!is_destructive("systemctl restart nginx"));
+        assert!(destructive_reason("rm file.txt").is_none());
+        assert!(destructive_reason("rm -r build/").is_none());
+        assert!(destructive_reason("chmod +x script.sh").is_none());
+        assert!(destructive_reason("curl -s https://api.example.com/data").is_none());
+        assert!(destructive_reason("ls -la; df -h").is_none());
+        assert!(destructive_reason("grep -r pattern .").is_none());
+        assert!(destructive_reason("docker rm -f webapp").is_none());
+        assert!(destructive_reason("systemctl restart nginx").is_none());
     }
 
     #[test]
@@ -694,9 +734,23 @@ mod tests {
 
     #[test]
     fn confirm_data_parsing() {
-        assert_eq!(parse_confirm("hmc:42:ok"), Some((42, true)));
-        assert_eq!(parse_confirm("hmc:7:no"), Some((7, false)));
+        assert_eq!(parse_confirm("hmc:42:ok"), Some((42, ConfirmVerdict::Allow)));
+        assert_eq!(parse_confirm("hmc:7:always"), Some((7, ConfirmVerdict::Always)));
+        assert_eq!(parse_confirm("hmc:7:no"), Some((7, ConfirmVerdict::Deny)));
         assert_eq!(parse_confirm("hmc:x:ok"), None);
         assert_eq!(parse_confirm("other:1:ok"), None);
+    }
+
+    #[test]
+    fn destructive_reason_labels() {
+        assert_eq!(
+            destructive_reason("rm -rf /tmp/x"),
+            Some("hapus rekursif + force (rm -rf)")
+        );
+        assert_eq!(destructive_reason("ls -la"), None);
+        assert_eq!(
+            destructive_reason("chmod -R 777 /var/www"),
+            Some("ubah izin rekursif (chmod -R)")
+        );
     }
 }

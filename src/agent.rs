@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::context;
 use crate::memory;
+use crate::notify::Notifier;
 use crate::provider::{ApiMessage, AiProvider, ContentBlock};
 use crate::shell::ShellCtx;
 use crate::soul;
@@ -11,8 +12,10 @@ use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Guard anti-loop: maksimum iterasi tool-calling per turn.
-const MAX_TOOL_ITERATIONS: usize = 8;
+/// Guard anti-loop: maksimum iterasi tool-calling per turn. 8 terbukti kurang
+/// untuk task multi-langkah (uninstall package = stop/remove/verify, dst.) —
+/// agent berhenti diam-diam padahal tugas belum selesai.
+const MAX_TOOL_ITERATIONS: usize = 16;
 /// Batas panjang pesan yang dipersist ke history (jaga tabel messages ramping).
 const MAX_SAVED_CHARS: usize = 8000;
 
@@ -65,7 +68,9 @@ impl Agent {
              owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tools: `create_reminder` \
              (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
              owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
-             efektif; command destruktif otomatis minta approval owner via tombol Telegram), \
+             efektif; command destruktif otomatis minta approval owner via tombol Telegram — \
+             kalau owner approve, lanjutkan tugasnya; kalau ditolak/timeout, laporkan ke owner \
+             dan jangan ulangi command yang sama sendiri), \
              `read_file`/`write_file` (hanya dalam workdir yang diizinkan), `web_search` \
              (info terkini dari web), `fetch_url` (isi halaman sebagai markdown), \
              `generate_image` (buat gambar → dikirim sebagai foto ke owner), `save_skill` \
@@ -74,7 +79,16 @@ impl Agent {
              teknis: baca file yang relevan dulu sebelum mengubah apa pun. Untuk pertanyaan \
              yang butuh info terbaru (versi, harga, berita, error baru): selalu `web_search` \
              dulu — jangan menebak dari pengetahuan lama. Setelah menyelesaikan masalah teknis \
-             non-trivial: simpan prosedurnya dengan `save_skill`.",
+             non-trivial: simpan prosedurnya dengan `save_skill`.\n\n## Cara bekerja (WAJIB)\n1. \
+             Tugas manajemen sistem yang sah (install/uninstall package, restart service, edit \
+             config, debug error) KERJAKAN LANGSUNG dengan tools — jangan menolak dengan saran \
+             generik. Command berisiko otomatis diminta approval owner, jadi tidak perlu ragu.\n2. \
+             Kalau satu langkah gagal (error, permission, timeout, ditolak owner), jelaskan \
+             penyebabnya dari pesan error dan usulkan langkah alternatif — jangan berhenti diam.\n3. \
+             Di jawaban akhir selalu ringkas: apa yang sudah dilakukan, hasilnya, dan langkah \
+             berikutnya yang disarankan.\n4. Kerjakan tugas multi-langkah sampai tuntas — pakai \
+             hasil tiap tool sebagai input langkah berikutnya. Kalau batas langkah tercapai, \
+             laporkan status terakhir dan minta owner bilang \"lanjut\".",
             soul::load(&self.cfg.soul_path),
             facts,
             skills_section,
@@ -83,9 +97,15 @@ impl Agent {
     }
 
     /// Satu turn percakapan lengkap: simpan pesan → load N-history → call provider →
-    /// eksekusi tool calls (loop) → balas. `include_history = false` dipakai untuk
-    /// scheduled job (context segar, Pilar 4).
-    pub async fn run_turn(&self, chat_id: i64, user_text: &str, include_history: bool) -> Result<String> {
+    /// eksekusi tool calls (loop, tiap langkah dilaporkan via Notifier) → balas.
+    /// `include_history = false` dipakai untuk scheduled job (context segar, Pilar 4).
+    pub async fn run_turn(
+        &self,
+        chat_id: i64,
+        user_text: &str,
+        include_history: bool,
+        notify: Option<&Notifier>,
+    ) -> Result<String> {
         context::save_message(&self.pool, chat_id, "user", user_text).await?;
 
         let facts = memory::facts_for_prompt(&self.pool, chat_id).await?;
@@ -109,9 +129,23 @@ impl Agent {
 
         let tool_defs = tools::definitions();
         let mut collected_text = String::new();
+        let mut last_stop = String::from("end_turn");
 
         for i in 0..MAX_TOOL_ITERATIONS {
+            // Progres mulai iterasi ke-2 — iterasi pertama ditutupi typing indicator,
+            // jadi chat sederhana tanpa tool tetap bersih tanpa pesan status.
+            if i > 0 {
+                if let Some(n) = notify {
+                    n.notify(format!(
+                        "🧠 memproses hasil tool… (langkah {}/{})",
+                        i + 1,
+                        MAX_TOOL_ITERATIONS
+                    ));
+                }
+            }
+
             let resp = self.provider.chat(&system, &messages, &tool_defs).await?;
+            last_stop = resp.stop_reason.clone();
             tracing::debug!(stop_reason = %resp.stop_reason, iteration = i, "provider response");
             {
                 let mut u = self.usage.lock().unwrap();
@@ -157,12 +191,39 @@ impl Agent {
                 break;
             }
 
-            // Eksekusi semua tool call, kirim hasilnya sebagai tool_result
+            // Eksekusi semua tool call, kirim hasilnya sebagai tool_result. Tiap
+            // langkah dilaporkan ke Telegram (pesan progres live) — owner tidak lagi
+            // menghadap layar diam selama agent bekerja.
             let mut results = Vec::new();
             for (id, name, input) in tool_uses {
+                if let Some(n) = notify {
+                    let args = short_input(&input);
+                    n.notify(format!(
+                        "🔧 {name}{} …",
+                        if args.is_empty() { String::new() } else { format!(": {args}") }
+                    ));
+                }
+                let t0 = Instant::now();
                 let out = match tools::execute(&self.shell, &self.web, chat_id, &name, &input).await {
-                    Ok(s) => s,
-                    Err(e) => format!("❌ tool error: {:#}", e),
+                    Ok(s) => {
+                        if let Some(n) = notify {
+                            n.notify(format!(
+                                "✅ {name} selesai ({:.1}s) — lanjut…",
+                                t0.elapsed().as_secs_f64()
+                            ));
+                        }
+                        s
+                    }
+                    Err(e) => {
+                        tracing::warn!(tool = %name, chat_id, "tool gagal: {e:#}");
+                        if let Some(n) = notify {
+                            n.notify(format!(
+                                "⚠️ {name} gagal ({:.1}s) — dilaporkan ke model",
+                                t0.elapsed().as_secs_f64()
+                            ));
+                        }
+                        format!("❌ tool error: {:#}", e)
+                    }
                 };
                 tracing::info!(tool = %name, chat_id, result = %out, "tool executed");
                 results.push(ContentBlock::ToolResult {
@@ -177,15 +238,42 @@ impl Agent {
 
             if i == MAX_TOOL_ITERATIONS - 1 {
                 tracing::warn!(chat_id, "tool loop mencapai batas iterasi — dipaksa berhenti");
+                if let Some(n) = notify {
+                    n.notify(format!("⚠️ batas {} langkah tool tercapai", MAX_TOOL_ITERATIONS));
+                }
             }
         }
 
+        // Jangan pernah balas kosong/diam — setiap kondisi berhenti punya kabar bagi
+        // owner (keluhan "ngomong sama tembok").
         if collected_text.trim().is_empty() {
-            collected_text = "(tidak ada respons teks dari model)".into();
+            collected_text = match last_stop.as_str() {
+                "tool_use" => format!(
+                    "⚠️ Aku berhenti karena mencapai batas {} langkah tool per turn. Status \
+                     terakhir sudah diproses — bilang \"lanjut\" kalau tugasnya belum selesai.",
+                    MAX_TOOL_ITERATIONS
+                ),
+                _ => "⚠️ Model tidak mengirim teks balasan — coba kirim ulang pesanmu.".into(),
+            };
+        } else if last_stop == "max_tokens" {
+            collected_text.push_str("\n\n⚠️ (balasan terpotong — batas token model tercapai)");
         }
 
         let saved: String = collected_text.chars().take(MAX_SAVED_CHARS).collect();
         context::save_message(&self.pool, chat_id, "assistant", &saved).await?;
         Ok(collected_text)
     }
+}
+
+/// Ringkasan satu-baris input tool untuk pesan progres
+/// (mis. `run_command: npm uninstall -g opencode`).
+fn short_input(input: &serde_json::Value) -> String {
+    const KEYS: &[&str] = &["command", "query", "url", "path", "prompt", "fact", "message", "name"];
+    for k in KEYS {
+        if let Some(s) = input.get(*k).and_then(|v| v.as_str()) {
+            let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            return one_line.chars().take(90).collect();
+        }
+    }
+    String::new()
 }

@@ -69,9 +69,12 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "run_command".into(),
             description: "Jalankan shell command di VPS server ini (bash). Working directory \
                 diingat antar panggilan — `cd` efektif untuk command berikutnya. Command biasa \
-                langsung dieksekusi; command destruktif (rm -rf, dd, reboot, curl|sh, dst.) \
-                otomatis minta approval owner via tombol Telegram. Timeout eksekusi 120 detik; \
-                command interaktif (perlu input stdin) tidak didukung. Output panjang otomatis \
+                langsung dieksekusi; command berisiko (rm -rf, dd, reboot, curl|sh, dst.) \
+                otomatis diminta approval owner via tombol Telegram (✅ jalankan sekali / \
+                🔁 sesi ini / ❌ tolak) — kalau approved, LANJUTKAN tugasnya sampai selesai; \
+                kalau ditolak/timeout, laporkan dan JANGAN ulangi sendiri. Timeout eksekusi \
+                120 detik; command interaktif (perlu input stdin) tidak didukung — pakai flag \
+                non-interaktif (-y, DEBIAN_FRONTEND=noninteractive). Output panjang otomatis \
                 dikirim sebagai file ke owner."
                 .into(),
             input_schema: json!({

@@ -100,7 +100,7 @@ impl Config {
             confirm_timeout: env::var("CONFIRM_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+                .unwrap_or(600), // 10 menit — owner bisa keburu jauh dari HP
             search_provider: env::var("SEARCH_PROVIDER")
                 .unwrap_or_else(|_| "tavily".into())
                 .to_ascii_lowercase(),

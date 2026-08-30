@@ -1,15 +1,23 @@
 use crate::agent::Agent;
+use crate::notify::Notifier;
+use crate::shell::ConfirmVerdict;
 use crate::{memory, ocr, reminders, review, shell, skills};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, CallbackQuery, ChatAction, ChatId};
+use teloxide::types::{BotCommand, CallbackQuery, ChatId};
+
+/// Pencegah "ngomong sama tembok" versi ekstrem: batas total satu turn. Kalau
+/// semuanya hang (provider, shell, konfirmasi tidak dijawab), turn dibunuh dan
+/// owner TETAP dapat kabar — tidak pernah diem selamanya.
+const TURN_TIMEOUT: Duration = Duration::from_secs(900);
 
 const HELP_TEXT: &str = "🤖 **Hermes-Lite**\n\
 \n\
-Chat langsung aja — aku inget konteks & fakta penting tentang kamu.\n\
+Chat langsung aja — aku inget konteks & fakta penting tentang kamu. Saat aku \
+kerja (run command, search, dll.), muncul pesan progres tiap langkah.\n\
 \n\
 **Perintah:**\n\
 /status — uptime, provider, model\n\
@@ -127,10 +135,12 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, agent: Arc<Agent>) -> Resul
             Some(sender) => {
                 // Kirim verdict ke run_command yang sedang menunggu (oneshot).
                 let _ = sender.send(verdict);
-                let text = if verdict {
-                    "✅ Approved — melanjutkan eksekusi…"
-                } else {
-                    "❌ Denied — perintah dibatalkan."
+                let text = match verdict {
+                    ConfirmVerdict::Allow => "✅ Approved (sekali) — melanjutkan eksekusi…",
+                    ConfirmVerdict::Always => {
+                        "🔁 Approved (sesi ini) — command sama tidak akan ditanya lagi sampai bot restart."
+                    }
+                    ConfirmVerdict::Deny => "❌ Denied — perintah dibatalkan.",
                 };
                 let _ = bot
                     .edit_message_text(msg.chat().id, msg.id(), text)
@@ -168,68 +178,108 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()>
 
     let text = match msg.text() {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => return Ok(()),
+        // Tipe pesan lain (dokumen, voice, sticker, dsb.) TIDAK di-drop diam —
+        // owner selalu dapat kabar (dulu: "ngomong sama tembok").
+        _ => {
+            bot.send_message(
+                msg.chat.id,
+                "🤔 Aku belum bisa memproses tipe pesan ini (dokumen/voice/sticker/dll.).\n\
+                 Kirim aja isinya sebagai teks, atau screenshot sebagai foto (aku bisa OCR).",
+            )
+            .await?;
+            return Ok(());
+        }
     };
-    // Typing indicator fire-and-forget (UX murah)
-    {
-        let b = bot.clone();
-        let cid = msg.chat.id;
-        tokio::spawn(async move {
-            let _ = b.send_chat_action(cid, ChatAction::Typing).await;
-        });
-    }
+
+    // Notifier: typing indicator berkelanjutan + pesan progres per tool call.
+    let notifier = Notifier::start(bot.clone(), msg.chat.id);
 
     let outcome: Result<String> = if text.starts_with('/') {
         handle_command(&agent, chat_id, &text).await
     } else {
-        agent.run_turn(chat_id, &text, true).await
+        match tokio::time::timeout(
+            TURN_TIMEOUT,
+            agent.run_turn(chat_id, &text, true, Some(&notifier)),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!(
+                "turn melebihi batas {} detik — provider kemungkinan lambat/hang",
+                TURN_TIMEOUT.as_secs()
+            )),
+        }
     };
 
     match outcome {
         Ok(reply) => {
             // Background review pasca-turn (Pilar 6): fire-and-forget, tanpa latency.
             review::spawn_post_turn_review(agent.clone(), chat_id, text.clone(), reply.clone());
+            // Hapus pesan progres — balasan final yang mewakili hasil.
+            notifier.finish(None).await;
             send_long(&bot, msg.chat.id, &reply).await?;
         }
         Err(e) => {
             tracing::error!(chat_id, "turn error: {:#}", e);
-            let msg_text: String = e.to_string().chars().take(500).collect();
-            bot.send_message(msg.chat.id, format!("⚠️ Error: {}", msg_text))
-                .await?;
+            notifier.finish(Some("❌ turn gagal".into())).await;
+            let cause = root_cause(&e);
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "⚠️ Ada kendala: {cause}\n\nCoba kirim ulang. Kalau terus terjadi, cek \
+                     /status atau log server (`journalctl -u hermes-lite -n 50`)."
+                ),
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
+/// Ambil akar penyebab dari chain anyhow (`a: b: c` → `c`) — pesan error yang
+/// langsung ke inti masalah, bukan bertumpuk menggurui.
+fn root_cause(e: &anyhow::Error) -> String {
+    let s = format!("{e:#}");
+    let s = s
+        .rsplit_once(": ")
+        .map(|(_, r)| r.trim().to_string())
+        .unwrap_or(s);
+    s.chars().take(300).collect()
+}
+
 /// Foto dari owner: download resolusi terbesar → OCR Tesseract lokal → teks jadi
 /// prompt biasa → turn agent penuh (tools tersedia). Kualitas OCR bergantung kualitas
 /// gambar (Pilar 7 trade-off yang disadari).
-async fn handle_photo(bot: &Bot, msg: &Message, agent: &Arc<Agent>, photos: &[teloxide::types::PhotoSize]) -> Result<()> {
+async fn handle_photo(
+    bot: &Bot,
+    msg: &Message,
+    agent: &Arc<Agent>,
+    photos: &[teloxide::types::PhotoSize],
+) -> Result<()> {
     let chat_id = msg.chat.id.0;
-    {
-        let b = bot.clone();
-        let cid = msg.chat.id;
-        tokio::spawn(async move {
-            let _ = b.send_chat_action(cid, ChatAction::Typing).await;
-        });
-    }
+    let notifier = Notifier::start(bot.clone(), msg.chat.id);
 
     let largest = ocr::largest_photo(photos);
+    notifier.notify("📥 mengunduh foto…");
     let bytes = ocr::download_photo(bot, largest).await?;
     tracing::info!(chat_id, bytes = bytes.len(), "foto diterima — OCR");
 
-    let text = match ocr::extract_text(bytes, &agent.cfg.ocr_lang, agent.cfg.ocr_tessdata.as_deref()).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(chat_id, "OCR gagal: {e:#}");
-            let m: String = format!("⚠️ OCR gagal: {e:#}").chars().take(400).collect();
-            bot.send_message(msg.chat.id, m).await?;
-            return Ok(());
-        }
-    };
+    notifier.notify("🔍 OCR — membaca teks dari foto…");
+    let text =
+        match ocr::extract_text(bytes, &agent.cfg.ocr_lang, agent.cfg.ocr_tessdata.as_deref()).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(chat_id, "OCR gagal: {e:#}");
+                notifier.finish(Some(format!("❌ OCR gagal: {}", root_cause(&e)))).await;
+                let m: String = format!("⚠️ OCR gagal: {e:#}").chars().take(400).collect();
+                bot.send_message(msg.chat.id, m).await?;
+                return Ok(());
+            }
+        };
 
     // Nggak nemu teks → jawab langsung tanpa LLM call (murah & deterministik)
     if text.chars().count() < 12 {
+        notifier.finish(None).await;
         bot.send_message(
             msg.chat.id,
             "🤷 OCR tidak menemukan teks yang terbaca dari foto ini. Coba foto lebih \
@@ -240,18 +290,42 @@ async fn handle_photo(bot: &Bot, msg: &Message, agent: &Arc<Agent>, photos: &[te
     }
 
     let prompt = ocr::build_prompt(msg.caption(), &text);
-    match agent.run_turn(chat_id, &prompt, true).await {
-        Ok(reply) => {
+    notifier.notify("🧠 memproses teks foto…");
+    let turn = tokio::time::timeout(
+        TURN_TIMEOUT,
+        agent.run_turn(chat_id, &prompt, true, Some(&notifier)),
+    )
+    .await;
+    match turn {
+        Ok(Ok(reply)) => {
+            notifier.finish(None).await;
             review::spawn_post_turn_review(agent.clone(), chat_id, prompt, reply.clone());
             send_long(bot, msg.chat.id, &reply).await?;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(chat_id, "photo turn error: {:#}", e);
-            let m: String = e.to_string().chars().take(500).collect();
-            bot.send_message(msg.chat.id, format!("⚠️ Error: {m}")).await?;
+            notifier.finish(Some("❌ gagal memproses foto".into())).await;
+            let cause = root_cause(&e);
+            bot.send_message(
+                msg.chat.id,
+                format!("⚠️ Ada kendala: {cause}\n\nCoba kirim ulang fotonya."),
+            )
+            .await?;
+        }
+        Err(_) => {
+            notifier.finish(Some("⏱️ timeout — turn dibatalkan".into())).await;
+            bot.send_message(msg.chat.id, turn_timeout_text()).await?;
         }
     }
     Ok(())
+}
+
+fn turn_timeout_text() -> String {
+    format!(
+        "⏱️ Pekerjaan ini melebihi batas {} menit jadi kuhentikan — biasanya provider \
+         lagi lambat/hang. Coba kirim ulang, atau pecah jadi tugas yang lebih kecil.",
+        TURN_TIMEOUT.as_secs() / 60
+    )
 }
 
 /// Slash commands — diproses langsung di gateway TANPA lewat LLM (murah & deterministik).
@@ -407,20 +481,43 @@ async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
             match r.kind.as_str() {
                 "job" => {
                     // Job: agent mengeksekusi instruksi dengan context segar (Pilar 4).
+                    // Notifier kasih visibilitas progres — job bisa jalan berhari-hari.
                     // Konvensi job prompt: balas "SKIP" = tidak ada yang perlu
                     // dikirim (mis. hari rest) — diam, tanpa spam ke owner.
+                    let n = Notifier::start(bot.clone(), ChatId(r.chat_id));
+                    let preview: String = r.message.chars().take(120).collect();
+                    n.notify(format!("⚙️ job mulai: {preview}"));
                     let out = agent
                         .run_turn(
                             r.chat_id,
                             &format!("⚙️ [scheduled job] {}", r.message),
                             false,
+                            Some(&n),
                         )
-                        .await?;
-                    if out.trim().eq_ignore_ascii_case("skip") {
-                        tracing::info!(reminder_id = r.id, "job SKIP — tidak ada output utk owner");
-                    } else {
-                        send_long(bot, ChatId(r.chat_id), &format!("⚙️ Job selesai:\n{}", out))
-                            .await?;
+                        .await;
+                    match out {
+                        Ok(out) => {
+                            if out.trim().eq_ignore_ascii_case("skip") {
+                                n.finish(None).await;
+                                tracing::info!(
+                                    reminder_id = r.id,
+                                    "job SKIP — tidak ada output utk owner"
+                                );
+                            } else {
+                                n.finish(None).await;
+                                send_long(
+                                    bot,
+                                    ChatId(r.chat_id),
+                                    &format!("⚙️ Job selesai:\n{}", out),
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(e) => {
+                            n.finish(Some(format!("❌ job gagal: {}", root_cause(&e))))
+                                .await;
+                            return Err(e);
+                        }
                     }
                 }
                 _ => {
