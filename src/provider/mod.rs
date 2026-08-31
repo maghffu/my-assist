@@ -74,6 +74,7 @@ pub fn build(cfg: &Config) -> Result<Arc<dyn AiProvider>> {
             cfg.anthropic_base_url.clone(),
             cfg.anthropic_api_key.clone(),
             cfg.anthropic_model.clone(),
+            cfg.anthropic_effort.clone(),
         ))),
         other => bail!(
             "provider tidak dikenal: {:?} (tersedia: anthropic). Set AI_PROVIDER.",

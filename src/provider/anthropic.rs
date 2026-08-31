@@ -22,10 +22,14 @@ pub struct AnthropicProvider {
     api_url: String,
     api_key: String,
     model: String,
+    /// Ekstensi z.ai (Anthropic-compatible): thinking intensity low|high|max.
+    /// None = jangan kirim field output_config sama sekali (request tetap
+    /// valid utk Anthropic asli maupun provider lain).
+    effort: Option<String>,
 }
 
 impl AnthropicProvider {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+    pub fn new(base_url: String, api_key: String, model: String, effort: Option<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
@@ -35,6 +39,7 @@ impl AnthropicProvider {
             api_url: format!("{}/v1/messages", base_url.trim_end_matches('/')),
             api_key,
             model,
+            effort,
         }
     }
 }
@@ -47,6 +52,15 @@ struct ReqBody<'a> {
     messages: &'a [ApiMessage],
     #[serde(skip_serializing_if = "<[ToolDef]>::is_empty")]
     tools: &'a [ToolDef],
+    /// Ekstensi z.ai: kontrol thinking intensity. Field non-standar — hanya
+    /// di-serialize bila di-set supaya request ke provider lain tak ternoda.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig<'a>>,
+}
+
+#[derive(Serialize)]
+struct OutputConfig<'a> {
+    effort: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +94,7 @@ impl AiProvider for AnthropicProvider {
             system,
             messages,
             tools,
+            output_config: self.effort.as_deref().map(|e| OutputConfig { effort: e }),
         };
 
         // Retry loop: error sementara (429/5xx/timeout koneksi) jangan langsung

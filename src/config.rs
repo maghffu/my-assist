@@ -12,6 +12,10 @@ pub struct Config {
     /// Base URL provider — default api.anthropic.com; bisa diganti ke endpoint
     /// Anthropic-compatible milik provider lain (mis. GLM: open.bigmodel.cn/api/anthropic).
     pub anthropic_base_url: String,
+    /// Effort / thinking intensity (ekstensi z.ai GLM): low|high|max, dikirim
+    /// sebagai output_config.effort. None = default provider (z.ai: max).
+    /// Ekstensi non-standar — HANYA dikirim bila di-set (skip_serializing_if).
+    pub anthropic_effort: Option<String>,
     pub ai_provider: String,
     /// Hard allowlist chat id (Pilar 9 keamanan #1) — pesan dari luar ini di-drop total.
     pub allowed_chat_ids: Vec<i64>,
@@ -72,6 +76,19 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.anthropic.com".into())
                 .trim_end_matches('/')
                 .to_string(),
+            anthropic_effort: {
+                let e = env::var("ANTHROPIC_EFFORT")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                match e.as_str() {
+                    "" => None,
+                    "low" | "high" | "max" => Some(e),
+                    other => anyhow::bail!(
+                        "ANTHROPIC_EFFORT harus low|high|max (dapat: {other:?})"
+                    ),
+                }
+            },
             ai_provider: env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".into()),
             allowed_chat_ids,
             n_context: env::var("N_CONTEXT")
