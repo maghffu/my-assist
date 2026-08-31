@@ -118,16 +118,16 @@ VPS: hermes-lite-deploy.timer → poll-deploy.sh → install.sh → restart serv
 | Komponen | Lokasi | Fungsi |
 |---|---|---|
 | `.github/workflows/build-release.yml` | repo | Build CI + publish release |
-| `deploy/oc9-appstream.repo` | repo | Repo oc9 publik utk tesseract-devel 5.3.2-8.oc9 |
 | `deploy/install-release.sh` | tarball (`install.sh`) | Installer VPS (update binary/soul/unit, verifikasi service) |
 | `deploy/poll-deploy.sh` | `/opt/hermes-lite/bin/` | Poll release, cek sha256, panggil installer |
 | `deploy/hermes-lite-deploy.{service,timer}` | VPS systemd | Trigger tiap 5 menit |
 
-**Kenapa rockylinux:9 + repo oc9**: runner `ubuntu-latest` (glibc 2.39)
-menghasilkan binary yang gagal jalan di VPS (glibc 2.38), dan tesseract EL9
-tidak ada di EPEL. Dengan tesseract-devel **exact sama** (`.oc9`), DT_NEEDED
-binary CI = `libtesseract.so.5.3.2` persis seperti binary lama — tanpa
-patchelf/symlink hack.
+**Kenapa rockylinux:9 + source build**: runner `ubuntu-latest` (glibc 2.39)
+menghasilkan binary yang gagal jalan di VPS (glibc 2.38); rpm `.oc9` tidak
+bisa dipasang di container glibc 2.34 (butuh GLIBC_2.38); dan tesseract tidak
+ada di EPEL9. Maka tesseract 5.3.2 + leptonica 1.84.0 (versi exact spt VPS)
+dibuild dari source upstream — di-cache permanen. Soname `libtesseract.so.5`
+diresolve di VPS via symlink yang dibuat otomatis oleh install.sh.
 
 **Operasi sehari-hari:**
 

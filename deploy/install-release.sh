@@ -12,6 +12,12 @@ APP_DIR="/opt/hermes-lite"
 SERVICE="hermes-lite"
 
 install -d -m 0750 "$APP_DIR"
+# Soname libtesseract.so.5 (build upstream) — di VPS file-nya polos tanpa symlink
+# (paket .oc9 tanpa soname); buat symlink idempotent ke file yang ada.
+tess_real=$(ls /lib64/libtesseract.so.5.* 2>/dev/null | head -n1)
+if [[ -n "$tess_real" && ! -e /lib64/libtesseract.so.5 ]]; then
+    ln -s "$(basename "$tess_real")" /lib64/libtesseract.so.5
+fi
 install -m 0755 "$SRC/hermes-lite"         "$APP_DIR/hermes-lite.new"
 install -m 0644 "$SRC/soul.md"             "$APP_DIR/soul.md"
 install -m 0644 "$SRC/BUILD_INFO"          "$APP_DIR/BUILD_INFO"

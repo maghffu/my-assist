@@ -5,10 +5,12 @@ name: build-release
 #   push tag v*   -> release stabil
 # VPS men-poll release via deploy/poll-deploy.sh (systemd timer) — tanpa secrets.
 #
-# Build di container rockylinux:9 (glibc 2.34, aman turun ke VPS OpenCloudOS 9 /
-# glibc 2.38). tesseract & leptonica dipasang dari repo oc9 publik dengan versi
-# EXACT sama seperti di VPS (tesseract-devel-5.3.2-8.oc9) supaya DT_NEEDED
-# binary identik — tidak perlu patchelf / symlink hack.
+# Container rockylinux:9 (glibc 2.34, aman turun ke VPS OpenCloudOS 9 / glibc 2.38).
+# tesseract 5.3.2 + leptonica 1.84.0 dibuild dari source upstream — versi EXACT
+# sama dengan yang terpasang di VPS (rpm .oc9 tidak bisa dipakai karena
+# membutuhkan glibc 2.38). Hasil build di-cache, build berikutnya instan.
+# Binary membutuhkan soname libtesseract.so.5 — symlink-nya dibuat otomatis
+# oleh deploy/install-release.sh di VPS.
 
 on:
   push:
@@ -33,22 +35,48 @@ jobs:
       # melihat path yang di-bind-mount, bukan filesystem container).
       CARGO_HOME: ${{ github.workspace }}/.cargo-home
       RUSTUP_HOME: /usr/local/rustup
+      PKG_CONFIG_PATH: /opt/tess/lib64/pkgconfig
     steps:
       - uses: actions/checkout@v4
 
-      - name: Base toolchain (gcc/clang/openssl)
+      - name: Base toolchain + deps tesseract source build
         run: |
-          dnf -y install gcc gcc-c++ clang openssl-devel pkg-config curl tar > /tmp/base.log 2>&1 \
+          dnf -y install gcc gcc-c++ clang make cmake curl tar git \
+              openssl-devel pkg-config \
+              libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel \
+              giflib-devel openjpeg2-devel libicu-devel libarchive-devel \
+              > /tmp/base.log 2>&1 \
             || { echo "::error::BASE_DNF: $(tail -c 500 /tmp/base.log | tr '\n' ' ')"; exit 1; }
 
-      - name: Tambah repo oc9 (tesseract identik VPS)
-        run: install -m 0644 deploy/oc9-appstream.repo /etc/yum.repos.d/
+      - name: Cache tesseract/leptonica source build
+        uses: actions/cache@v4
+        with:
+          path: /opt/tess
+          key: tess-5.3.2-lept-1.84.0-v1
 
-      - name: Tesseract 5.3.2 + leptonica 1.84 (oc9, exact spt VPS)
+      - name: Build leptonica 1.84.0 + tesseract 5.3.2 dari source (sekali, cached)
         run: |
-          dnf -y --setopt=install_weak_deps=False install \
-              tesseract-devel-5.3.2-8.oc9 leptonica-devel-1.84.0-3.oc9 > /tmp/tess.log 2>&1 \
-            || { echo "::error::TESS_DNF: $(tail -c 500 /tmp/tess.log | tr '\n' ' ')"; exit 1; }
+          if [[ -f /opt/tess/lib64/pkgconfig/tesseract.pc ]]; then
+            echo "cache hit — skip source build"; exit 0
+          fi
+          set -e
+          mkdir -p /tmp/tessbuild && cd /tmp/tessbuild
+          curl -fsSL -o leptonica.tar.gz \
+            https://github.com/DanBloomberg/leptonica/releases/download/1.84.0/leptonica-1.84.0.tar.gz
+          curl -fsSL -o tesseract.tar.gz \
+            https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.3.2.tar.gz
+          tar xzf leptonica.tar.gz
+          cmake -S leptonica-1.84.0 -B lept-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX=/opt/tess -DBUILD_PROG=OFF
+          cmake --build lept-build -j"$(nproc)" && cmake --install lept-build
+          tar xzf tesseract.tar.gz
+          cmake -S tesseract-5.3.2 -B tess-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX=/opt/tess \
+            -DBUILD_TRAINING_TOOLS=OFF -DBUILD_TESTS=OFF -DDISABLE_DOCS=ON \
+            -DLEPTONICA_DIR=/opt/tess/lib64
+          cmake --build tess-build -j"$(nproc)" && cmake --install tess-build
           pkg-config --modversion tesseract leptonica
 
       - name: Install Rust (stable)
@@ -70,12 +98,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Sanity check linkage (harus libtesseract.so.5.3.2 persis spt VPS)
+      - name: Sanity check linkage
         run: |
           objdump -p target/release/hermes-lite \
             | grep NEEDED | grep -E 'tesseract|leptonica|ssl|crypto' || true
-          objdump -p target/release/hermes-lite | grep -q 'libtesseract.so.5.3.2' \
-            || { echo '❌ DT_NEEDED tesseract tidak match VPS'; exit 1; }
+          objdump -p target/release/hermes-lite | grep -q 'libtesseract.so.5' \
+            || { echo "::error::DT_NEEDED libtesseract.so.5 tidak ada"; exit 1; }
 
       - name: Package tarball
         run: |
