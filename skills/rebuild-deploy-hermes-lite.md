@@ -1,39 +1,40 @@
-# Rebuild & Deploy hermes-lite dari Agent (tanpa SSH manual)
+# Deploy hermes-lite — CI (GitHub Actions) + fallback build-VPS
 
-Source: `/root/my-assist` (clone GitHub maghffu/my-assist, Rust). Service: `systemctl restart hermes-lite`. Per 30 Agu 2026 service jalan sebagai **root** (unit diubah owner) — tidak perlu sudo.
+Source: `/root/my-assist` (GitHub maghffu/my-assist, Rust). Service: `hermes-lite` (root, tanpa sudo).
+**Sejak 31 Agu 2026 build release TIDAK lagi di VPS** — pindah ke GitHub Actions (VPS 2-core tidak layak jadi build farm Rust).
 
-## Langkah
+## Alur utama: CI auto-deploy (git push → live ≤ 5 menit)
 
-1. **Patch source** — pakai script python anchored-replace (contoh: `/root/my-assist/patch_destructive.py`), jangan hand-edit besar. Idempotent: cek dulu `"system prune" in src` → batal kalau sudah.
-2. **Build di background** (cargo release butuh 1-2 menit > timeout 120s):
+1. **Patch source** di `/root/my-assist` — python anchored-replace / edit kecil. Selalu `grep -n "pattern" src/...` dulu sebelum commit (patch bisa hilang kalau ada git pull/reset dari sisi lain).
+2. **Commit + push ke main**:
    ```bash
-   cd /root/my-assist && nohup cargo build --release > /tmp/build.log 2>&1 &
+   cd /root/my-assist && git add -A && git commit -m "..." && git push
    ```
-   Poll: `tail -3 /tmp/build.log` sampai `Finished` / `error`.
-3. **Verifikasi patch masuk binary**: `strings target/release/hermes-lite | grep -E "pattern|baru"`
-4. **Deploy** (JANGAN cp langsung — binary sedang jalan & hardlink → ETXTBSY):
-   ```bash
-   cp target/release/hermes-lite /opt/hermes-lite/hermes-lite.new && mv -f /opt/hermes-lite/hermes-lite.new /opt/hermes-lite/hermes-lite
-   ```
-   (mv = rename → inode baru, proses lama aman.)
-5. **Restart dengan delay** — service menjalankan agent itu sendiri; restart = bunuh diri sendiri. Delay supaya pesan terakhir sempat terkirim:
-   ```bash
-   nohup bash -c 'sleep 15; systemctl restart hermes-lite' >/tmp/restart.log 2>&1 &
-   ```
+3. **CI build** (`.github/workflows/build-release.yml`): container `rockylinux:9` (glibc match VPS 2.38; runner ubuntu glibc 2.39 → binary gagal jalan di VPS), tesseract 5.3.2 + leptonica 1.84.0 build dari source, di-cache. Hasil: tarball + sha256 → GitHub Release tag `nightly` (tag `v*` = stabil). Build CI gagal = tidak ada release baru = VPS tetap jalan versi lama (aman, tidak pernah broken deploy).
+4. **VPS auto-poll**: `hermes-lite-deploy.timer` (enabled) jalan tiap 5 menit → `/opt/hermes-lite/bin/poll-deploy.sh` (tanpa token, repo publik) → bandingkan `.deployed-build` vs asset → download + verifikasi sha256 → `install.sh` → replace binary/soul/unit → restart service. Log: `journalctl -u hermes-lite-deploy`.
+5. **Verifikasi**: `cat /opt/hermes-lite/BUILD_INFO`, `systemctl show hermes-lite -p ActiveEnterTimestamp` ≥ waktu push, `journalctl -u hermes-lite -n 10` startup bersih.
 
-## Komunikasi saat deploy/restart (WAJIB — insiden 31 Agu 08:15, owner kehilangan kabar)
+File yang **TIDAK pernah dioverwrite** deploy: `.env`, `skills/`, `data/`, `keys/`.
 
-- **SEBELUM restart (step 5)**: kirim pesan dulu ke owner: deploy selesai, restart ~15 detik, "bakal sekejap hilang, nanti lapor balik". BARU eksekusi restart.
-- **Reminder lapor balik (WAJIB)**: sebelum restart, buat reminder one-shot `kind=job` di **+2 menit** dari waktu restart, instruksinya: "verifikasi hermes-lite hidup (systemctl show hermes-lite -p ActiveEnterTimestamp), cek /tmp/build.log & hasil patch, lalu LAPORKAN hasil deploy ke owner secara proaktif". Scheduler reload pending reminders saat startup → service hidup lagi, owner otomatis dapat laporan tanpa harus chat duluan.
-- Kalau build GAGAL: jangan restart sama sekali — laporkan error + usulan fix, binary lama tetap jalan.
-- Setelah hidup, aturan umum: turn pertama setelah downtime HARUS buka dengan status apa yang terjadi, bukan nunggu owner tanya "kok diem?".
+## Komunikasi saat deploy (WAJIB — insiden 31 Agu 08:15)
 
-## Gotchas
+- Deploy via timer = restart BISA terjadi kapan saja ≤5 menit setelah push. **SEBELUM push**: kabari owner dulu ("deploy jalan ≤5 menit, sebentar hilang ya").
+- Setelah push: buat reminder one-shot `kind=job` **+7 menit**: "verifikasi hermes-lite hidup (systemctl show hermes-lite -p ActiveEnterTimestamp), cek BUILD_INFO + journalctl -u hermes-lite-deploy, LAPORKAN hasil deploy ke owner secara proaktif".
+- Build CI gagal: jangan apa-apa di VPS — laporkan error CI + usulan fix; binary lama tetap jalan.
 
-- **NAMA BINARY: `hermes-lite`** (pakai hyphen, BUKAN `hermes`) — deploy 30 Agu gagal karena salah nama file.
-- **JANGAN PERNAH `systemctl stop hermes-lite` dari dalam agent** — INSIDEN 30 Agu 2026 18:25: chain `stop && cp && start` bunuh agent sendiri di step pertama, cp+start tidak pernah jalan, service mati 13 jam (SIGTERM exit bersih → `Restart=on-failure` tidak trigger). SELALU `restart` via detached delayed bash (langkah 5), atau minta owner jalankan manual.
-- Skill ini hanya di-inject kalau pesan owner mengandung token nama skill (rebuild/deploy/hermes/lite). Kalau task-mu berakhir dengan perlu mengganti binary service ini dan skill ini belum dimuat di atas → WAJIB `read_file skills/rebuild-deploy-hermes-lite.md` DULU sebelum menyentuh /opt/hermes-lite atau systemctl.
-- Patch BISA HILANG kalau owner git reset/pull ulang repo sebelum build (sudah pernah terjadi) — selalu `grep -n "pattern" src/shell.rs` dulu sebelum build.
-- Toolchain Rust di `/root/.cargo/bin` (rustup, installed 30 Agu 2026).
-- Verifikasi post-restart: `systemctl show hermes-lite -p ActiveEnterTimestamp` harus > waktu deploy.
-- `cargo build` incremental satu file ≈ 1m05s; build dari nol jauh lebih lama.
+## Channel & rollback
+
+- Channel default `nightly`. Ganti stabil: `echo v0.2.1 > /opt/hermes-lite/.deploy-channel` (di-pick poll berikutnya).
+- Rollback manual: `systemctl stop hermes-lite-deploy.timer` → extract tarball lama dari `/opt/hermes-lite/releases/` (3 terakhir disimpan) → `bash install.sh` → hidupkan timer lagi. Atau cukup `echo <tag-lama> > .deploy-channel`.
+
+## Fallback darurat: build on-VPS
+
+`cd /root/my-assist && sudo ./deploy/deploy.sh` — hanya kalau CI tidak bisa dipakai. Detail mode lama: build background `nohup cargo build --release > /tmp/build.log 2>&1 &` (incremental ~1 menit), verifikasi `strings target/release/hermes-lite | grep pattern`, install cp→`mv -f` (ETXTBSY), restart via delayed bash (lihat gotcha di bawah). Toolchain: `/root/.cargo/bin`.
+
+## Gotchas (tetap berlaku)
+
+- **NAMA BINARY: `hermes-lite`** (hyphen, BUKAN `hermes`) — deploy 30 Agu gagal karena salah nama.
+- **JANGAN PERNAH `systemctl stop hermes-lite` dari dalam agent** — INSIDEN 30 Agu 18:25: chain `stop && cp && start` bunuh agent sendiri di step pertama, service mati 13 jam (SIGTERM bersih → `Restart=on-failure` tidak trigger). SELALU `restart` via detached delayed bash: `nohup bash -c 'sleep 15; systemctl restart hermes-lite' >/tmp/restart.log 2>&1 &`.
+- Push ke main = deploy otomatis ≤5 menit. JANGAN push eksperimen setengah jadi ke main — pakai branch.
+- Skill ini hanya di-inject kalau pesan owner mengandung token nama skill (rebuild/deploy/hermes/lite). Kalau task-mu berujung mengganti binary service ini dan skill belum dimuat → WAJIB `read_file skills/rebuild-deploy-hermes-lite.md` DULU sebelum menyentuh /opt/hermes-lite atau systemctl.
+- Verifikasi post-deploy: `systemctl show hermes-lite -p ActiveEnterTimestamp` harus > waktu push/poll.
