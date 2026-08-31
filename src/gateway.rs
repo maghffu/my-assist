@@ -509,7 +509,6 @@ async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
     for r in reminders::due_now(&agent.pool).await? {
         tracing::info!(reminder_id = r.id, kind = %r.kind, "firing reminder");
 
-        let original_remind_at = r.remind_at;
         let outcome: Result<()> = async {
             match r.kind.as_str() {
                 "job" => {
@@ -570,7 +569,9 @@ async fn process_due_reminders(bot: &Bot, agent: &Agent) -> Result<()> {
                 match r
                     .recur
                     .as_deref()
-                    .and_then(|rec| reminders::compute_next_run(rec, original_remind_at))
+                    .and_then(|rec| {
+                        reminders::compute_next_run(rec, r.anchor_at.unwrap_or(r.remind_at), Utc::now())
+                    })
                 {
                     Some(next) => reminders::reschedule(&agent.pool, r.id, next).await?,
                     None => reminders::mark_sent(&agent.pool, r.id).await?,

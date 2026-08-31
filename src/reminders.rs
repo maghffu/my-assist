@@ -10,6 +10,9 @@ pub struct Reminder {
     pub kind: String,
     pub recur: Option<String>,
     pub fail_count: i32,
+    /// Anchor jadwal asli (jam saat dibuat) — recurring di-reschedule dari sini
+    /// supaya backoff/fire telat tidak menggeser HH:MM (bug drift 07:50→08:56).
+    pub anchor_at: Option<DateTime<Utc>>,
 }
 
 /// Maksimum backoff antar retry (8 jam) — utk recurring/one-shot yg gagal terus,
@@ -56,8 +59,8 @@ pub async fn create(
     recur: Option<String>,
 ) -> Result<i64> {
     let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO reminders (chat_id, message, remind_at, kind, recur)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO reminders (chat_id, message, remind_at, kind, recur, anchor_at)
+         VALUES ($1, $2, $3, $4, $5, $3) RETURNING id",
     )
     .bind(chat_id)
     .bind(message)
@@ -70,8 +73,8 @@ pub async fn create(
 }
 
 pub async fn due_now(pool: &PgPool) -> Result<Vec<Reminder>> {
-    let rows = sqlx::query_as::<_, (i64, i64, String, DateTime<Utc>, String, Option<String>, i32)>(
-        "SELECT id, chat_id, message, remind_at, kind, recur, fail_count
+    let rows = sqlx::query_as::<_, (i64, i64, String, DateTime<Utc>, String, Option<String>, i32, Option<DateTime<Utc>>)>(
+        "SELECT id, chat_id, message, remind_at, kind, recur, fail_count, anchor_at
          FROM reminders
          WHERE sent = false AND remind_at <= now()
          ORDER BY remind_at ASC
@@ -82,7 +85,7 @@ pub async fn due_now(pool: &PgPool) -> Result<Vec<Reminder>> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, chat_id, message, remind_at, kind, recur, fail_count)| Reminder {
+        .map(|(id, chat_id, message, remind_at, kind, recur, fail_count, anchor_at)| Reminder {
             id,
             chat_id,
             message,
@@ -90,6 +93,7 @@ pub async fn due_now(pool: &PgPool) -> Result<Vec<Reminder>> {
             kind,
             recur,
             fail_count,
+            anchor_at,
         })
         .collect())
 }
@@ -139,8 +143,8 @@ pub async fn reschedule(pool: &PgPool, id: i64, next: DateTime<Utc>) -> Result<(
 }
 
 pub async fn list_pending(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec<Reminder>> {
-    let rows = sqlx::query_as::<_, (i64, i64, String, DateTime<Utc>, String, Option<String>, i32)>(
-        "SELECT id, chat_id, message, remind_at, kind, recur, fail_count
+    let rows = sqlx::query_as::<_, (i64, i64, String, DateTime<Utc>, String, Option<String>, i32, Option<DateTime<Utc>>)>(
+        "SELECT id, chat_id, message, remind_at, kind, recur, fail_count, anchor_at
          FROM reminders
          WHERE sent = false AND chat_id = $1
          ORDER BY remind_at ASC
@@ -153,7 +157,7 @@ pub async fn list_pending(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec
 
     Ok(rows
         .into_iter()
-        .map(|(id, chat_id, message, remind_at, kind, recur, fail_count)| Reminder {
+        .map(|(id, chat_id, message, remind_at, kind, recur, fail_count, anchor_at)| Reminder {
             id,
             chat_id,
             message,
@@ -161,6 +165,7 @@ pub async fn list_pending(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec
             kind,
             recur,
             fail_count,
+            anchor_at,
         })
         .collect())
 }
@@ -175,12 +180,24 @@ pub async fn delete(pool: &PgPool, chat_id: i64, id: i64) -> Result<bool> {
 }
 
 /// 'daily' | 'weekly' (cron expression menyusul — ROADMAP Fase 3 note).
-pub fn compute_next_run(recur: &str, from: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match recur {
-        "daily" => Some(from + Duration::days(1)),
-        "weekly" => Some(from + Duration::weeks(1)),
-        _ => None,
+pub fn compute_next_run(
+    recur: &str,
+    anchor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let period = match recur {
+        "daily" => Duration::days(1),
+        "weekly" => Duration::weeks(1),
+        _ => return None,
+    };
+    // Anchor ke jam asli: next = occurrence anchor + k*period pertama yang > now.
+    // Fire telat (backoff / service down) tidak menggeser HH:MM — occurrence
+    // yang terlewat dilompati (catch-up), anchor tetap.
+    let mut next = anchor;
+    while next <= now {
+        next += period;
     }
+    Some(next)
 }
 
 /// Parse waktu dari tool call LLM: RFC 3339 dengan timezone,
@@ -230,5 +247,35 @@ mod tests {
         assert!(cumulative_backoff_secs(7) <= GIVEUP_AFTER_SECS);
         // fail_count 8 → +480 menit = 31.75 jam > 24 → menyerah
         assert!(cumulative_backoff_secs(8) > GIVEUP_AFTER_SECS);
+    }
+
+    fn fixed(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn daily_anchor_tetap_walau_fire_telat() {
+        // Anchor 07:50 WIB = 00:50 UTC; fire telat 1 jam (backoff/down).
+        let anchor = fixed("2026-08-31T00:50:00Z");
+        let next = compute_next_run("daily", anchor, anchor + Duration::hours(1)).unwrap();
+        // Tetap 00:50 besok — bukan ikut geser ke 01:50.
+        assert_eq!(next, fixed("2026-09-01T00:50:00Z"));
+    }
+
+    #[test]
+    fn daily_catch_up_setelah_down_lama() {
+        let anchor = fixed("2026-08-31T00:50:00Z");
+        // Down 3 hari, bangun 2 jam setelah occurrence hari ke-3.
+        let now = anchor + Duration::days(3) + Duration::hours(2);
+        let next = compute_next_run("daily", anchor, now).unwrap();
+        assert_eq!(next, fixed("2026-09-04T00:50:00Z"));
+    }
+
+    #[test]
+    fn weekly_anchor_dan_recur_tak_dikenal() {
+        let anchor = fixed("2026-08-31T00:50:00Z");
+        let next = compute_next_run("weekly", anchor, anchor).unwrap();
+        assert_eq!(next, fixed("2026-09-07T00:50:00Z"));
+        assert!(compute_next_run("hourly", anchor, anchor).is_none());
     }
 }

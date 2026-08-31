@@ -216,7 +216,26 @@ pub async fn execute(
             if message.is_empty() || remind_at_raw.is_empty() {
                 bail!("parameter 'message' dan 'remind_at' wajib diisi");
             }
-            let remind_at = reminders::parse_remind_at(&remind_at_raw)?;
+            let mut remind_at = reminders::parse_remind_at(&remind_at_raw)?;
+            // Recurring: kalau remind_at sudah lewat, roll forward ke kemunculan
+            // berikutnya (anchor HH:MM tetap) — cegah fire langsung & drift.
+            if input["recur"]
+                .as_str()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
+                let now = chrono::Utc::now();
+                while remind_at <= now {
+                    match reminders::compute_next_run(
+                        input["recur"].as_str().unwrap_or(""),
+                        remind_at,
+                        now,
+                    ) {
+                        Some(next) => remind_at = next,
+                        None => break,
+                    }
+                }
+            }
             let kind = input["kind"].as_str().unwrap_or("static").to_string();
             let recur = input["recur"]
                 .as_str()
@@ -234,6 +253,7 @@ pub async fn execute(
                 kind,
                 match reminders::compute_next_run(
                     input["recur"].as_str().unwrap_or(""),
+                    remind_at,
                     remind_at
                 ) {
                     Some(_) => ", berulang".to_string(),

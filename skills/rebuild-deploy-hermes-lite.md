@@ -21,6 +21,13 @@ Source: `/root/my-assist` (clone GitHub maghffu/my-assist, Rust). Service: `syst
    nohup bash -c 'sleep 15; systemctl restart hermes-lite' >/tmp/restart.log 2>&1 &
    ```
 
+## Komunikasi saat deploy/restart (WAJIB — insiden 31 Agu 08:15, owner kehilangan kabar)
+
+- **SEBELUM restart (step 5)**: kirim pesan dulu ke owner: deploy selesai, restart ~15 detik, "bakal sekejap hilang, nanti lapor balik". BARU eksekusi restart.
+- **Reminder lapor balik (WAJIB)**: sebelum restart, buat reminder one-shot `kind=job` di **+2 menit** dari waktu restart, instruksinya: "verifikasi hermes-lite hidup (systemctl show hermes-lite -p ActiveEnterTimestamp), cek /tmp/build.log & hasil patch, lalu LAPORKAN hasil deploy ke owner secara proaktif". Scheduler reload pending reminders saat startup → service hidup lagi, owner otomatis dapat laporan tanpa harus chat duluan.
+- Kalau build GAGAL: jangan restart sama sekali — laporkan error + usulan fix, binary lama tetap jalan.
+- Setelah hidup, aturan umum: turn pertama setelah downtime HARUS buka dengan status apa yang terjadi, bukan nunggu owner tanya "kok diem?".
+
 ## Gotchas
 
 - **NAMA BINARY: `hermes-lite`** (pakai hyphen, BUKAN `hermes`) — deploy 30 Agu gagal karena salah nama file.
