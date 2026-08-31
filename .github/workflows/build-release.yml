@@ -81,7 +81,7 @@ jobs:
             -DBUILD_TRAINING_TOOLS=OFF -DBUILD_TESTS=OFF -DDISABLE_DOCS=ON \
             -DLept_DIR=/opt/tess/lib64/cmake/leptonica
           cmake --build tess-build -j"$(nproc)" && cmake --install tess-build
-          pkg-config --modversion tesseract leptonica
+          pkg-config --modversion tesseract lept
 
       - name: Install Rust (stable)
         run: |
