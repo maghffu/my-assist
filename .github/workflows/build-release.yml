@@ -36,12 +36,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build deps
+      - name: Base toolchain (gcc/clang/openssl)
         run: |
-          dnf -y install gcc gcc-c++ clang openssl-devel pkg-config curl tar >/dev/null
-          install -m 0644 deploy/oc9-appstream.repo /etc/yum.repos.d/
+          dnf -y install gcc gcc-c++ clang openssl-devel pkg-config curl tar > /tmp/base.log 2>&1 \
+            || { echo "::error::BASE_DNF: $(tail -c 500 /tmp/base.log | tr '\n' ' ')"; exit 1; }
+
+      - name: Tambah repo oc9 (tesseract identik VPS)
+        run: install -m 0644 deploy/oc9-appstream.repo /etc/yum.repos.d/
+
+      - name: Tesseract 5.3.2 + leptonica 1.84 (oc9, exact spt VPS)
+        run: |
           dnf -y --setopt=install_weak_deps=False install \
-              tesseract-devel-5.3.2-8.oc9 leptonica-devel-1.84.0-3.oc9
+              tesseract-devel-5.3.2-8.oc9 leptonica-devel-1.84.0-3.oc9 > /tmp/tess.log 2>&1 \
+            || { echo "::error::TESS_DNF: $(tail -c 500 /tmp/tess.log | tr '\n' ' ')"; exit 1; }
+          pkg-config --modversion tesseract leptonica
 
       - name: Install Rust (stable)
         run: |
