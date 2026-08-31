@@ -37,11 +37,12 @@ jobs:
       RUSTUP_HOME: /usr/local/rustup
       PKG_CONFIG_PATH: /opt/tess/lib64/pkgconfig
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Base toolchain + deps tesseract source build
         run: |
-          dnf -y install gcc gcc-c++ clang make cmake curl tar git \
+          # giflib-devel & openjpeg2-devel ada di repo CRB (default disabled)
+          dnf -y --enablerepo=crb install gcc gcc-c++ clang make cmake curl tar git \
               openssl-devel pkg-config \
               libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel \
               giflib-devel openjpeg2-devel libicu-devel libarchive-devel \
