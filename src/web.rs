@@ -21,7 +21,7 @@ use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile};
 
-/// Cap konten fetch_url yang masuk context LLM; versi penuh dikirim sebagai file (Pilar 10).
+/// Cap konten fetch_url yang masuk context LLM — truncate-only, tanpa file (Pilar 10).
 const FETCH_MAX_CTX_CHARS: usize = 15_000;
 /// Batas download per request — cegah memory blow-up pada file raksasa.
 const MAX_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
@@ -129,22 +129,11 @@ impl WebCtx {
             );
         };
 
-        // Size handling (Pilar 10): > cap → file attachment ke owner, context dapat head.
+        // Size handling (Pilar 10, truncate-only): > cap → dipotong untuk context,
+        // tanpa file attachment (keputusan owner, konsisten Pilar 9).
         let total = fetched.text.chars().count();
-        if total > FETCH_MAX_CTX_CHARS {
-            let doc = InputFile::memory(fetched.text.clone().into_bytes())
-                .file_name(format!("hermes-fetch-{}.md", chrono::Utc::now().timestamp()));
-            if let Err(e) = self
-                .bot
-                .send_document(ChatId(chat_id), doc)
-                .caption(format!("📄 Isi penuh {} ({} char, via {})", url, total, fetched.source))
-                .await
-            {
-                tracing::error!(chat_id, "gagal kirim fetch sebagai file: {e:#}");
-            }
-        }
 
-        tracing::info!(url = %url, via = fetched.source, chars = total, "fetch_url");
+        tracing::info!(chat_id, url = %url, via = fetched.source, chars = total, "fetch_url");
         Ok(format!(
             "📄 {} (via {}, {} char):\n{}",
             url,
@@ -582,7 +571,7 @@ fn head_chars(s: &str, n: usize) -> String {
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     format!(
-        "{}…(dipotong — {total} char total; versi penuh dikirim sebagai file ke owner)",
+        "{}…(dipotong — {total} char total — butuh bagian lain? minta bagian spesifik)",
         &s[..end]
     )
 }

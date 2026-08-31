@@ -115,7 +115,7 @@ Kemampuan owner menyuruh agent mengeksekusi shell command di VPS — coding, set
 **Mekanik inti:**
 - `tokio::process::Command` spawn `bash -lc "cd $cwd && <cmd>"` — one-shot per command (bukan PTY persisten; `cwd` dilacak sebagai state tool biar `cd` tetap efektif antar panggilan, meniru perilaku bash tool Claude Code)
 - **Timeout per command** (default 120 detik) + kill process group supaya tidak meninggalkan proses yatim
-- **Output handling:** truncation dengan tail untuk konteks; output > ~4000 karakter dikirim sebagai file attachment (`send_document`) karena limit panjang pesan Telegram 4096 karakter
+- **Output handling:** truncate-only — tail output masuk context LLM (cap ±2000 karakter); **TIDAK ada file attachment** (`send_document` untuk output panjang dihapus — keputusan owner: file `.txt` yang terkirim otomatis lebih mengganggu daripada membantu). Mitigasi info hilang: deskripsi tool `run_command` mengarahkan agent pipe/limit dari awal (`| head`, `grep`, `LIMIT` di SQL) alih-alih dump penuh lalu filter. Batas 4096 karakter/pesan Telegram tetap di-handle gateway lewat chunking balasan agent
 - **Tool pendamping `read_file` / `write_file`** dengan batasan path di workdir yang diizinkan — biar agent bisa baca config / tulis kode tanpa heredoc atau echo via shell (lebih aman, lebih hemat token)
 
 **Keamanan — shell access artinya kebocoran token bot = remote code execution, jadi lapisan pertahanan wajib:**
@@ -149,7 +149,7 @@ Menutup celah **knowledge cutoff** LLM — tanpa web access, agent buta terhadap
 
 **Hygiene & batasan (berlaku semua tier):**
 1. **SSRF protection** — resolve DNS dulu, cek IP, baru fetch; block private/reserved range (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, link-local `169.254.169.254` metadata, `::1`)
-2. **Size cap** — konten > ~15-20KB dipotong untuk context, full versi dikirim sebagai file attachment (konsisten dengan output handling Pilar 9)
+2. **Size cap** — konten > ~15-20KB dipotong untuk context (truncate-only, tanpa file attachment — konsisten dengan output handling Pilar 9)
 3. **Timeout per request** (default 30 detik)
 4. **Hanya URL publik** — jangan pernah fetch URL yang butuh auth/berisi data sensitif melalui chain ini (tier 2-3 melewati infra pihak ketiga; identitas operator markdown.new pun tidak jelas)
 5. **No caching di MVP** — volume single-user kecil; tambahkan kalau terbukti quota jadi masalah (evidence-driven)

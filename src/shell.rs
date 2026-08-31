@@ -2,7 +2,8 @@
 //!
 //! Mekanik inti: `bash -lc "cd $cwd && <cmd>"` one-shot, cwd di-track per chat
 //! (biar `cd` efektif antar panggilan), timeout + kill process group, output
-//! panjang jadi file attachment, audit ke `command_logs`, secret masking.
+//! panjang di-truncate (truncate-only, tanpa file attachment — keputusan owner),
+//! audit ke `command_logs`, secret masking.
 //!
 //! Keamanan: command berisiko → confirmation gate 3 tombol (✅ sekali / 🔁 sesi
 //! ini / ❌ tolak), tool menunggu via oneshot channel dengan timeout.
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
+use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::oneshot;
@@ -35,8 +36,6 @@ pub enum ConfirmVerdict {
 
 /// Tool result ke LLM: tail sebanyak ini (AGENTS.md Pilar 9 — truncation dengan tail).
 const MAX_CTX_CHARS: usize = 2000;
-/// Output melebihi ini → dikirim sebagai file attachment (send_document).
-const FILE_THRESHOLD_CHARS: usize = 4000;
 /// read_file: cap konten yang masuk context LLM.
 const READ_FILE_MAX_CHARS: usize = 15_000;
 /// write_file: batas isi per call.
@@ -287,25 +286,9 @@ impl ShellCtx {
         self.audit(chat_id, cmd, exit_code, duration_ms).await;
         tracing::info!(chat_id, cmd, exit_code, duration_ms, timed_out, "run_command");
 
-        // Output handling (Pilar 9): > threshold → file attachment; context LLM dapat tail
+        // Output handling (Pilar 9, truncate-only): tidak ada file attachment —
+        // context LLM hanya menerima tail; agent diarahkan pipe/grep/LIMIT dari awal.
         let display = mask_secrets(&combined);
-        let total = display.chars().count();
-        if total > FILE_THRESHOLD_CHARS {
-            let fname = format!("hermes-output-{}.txt", started.elapsed().as_millis());
-            let doc = InputFile::memory(display.clone().into_bytes()).file_name(fname);
-            if let Err(e) = self
-                .bot
-                .send_document(ChatId(chat_id), doc)
-                .caption(format!(
-                    "📋 Output penuh `{}` ({} char)",
-                    truncate_chars(cmd, 80),
-                    total
-                ))
-                .await
-            {
-                tracing::error!(chat_id, "gagal kirim output sebagai file: {e:#}");
-            }
-        }
 
         Ok(mask_secrets(&format!(
             "$ {}\nexit={} duration={}ms{}\n{}",
@@ -327,19 +310,6 @@ impl ShellCtx {
             .with_context(|| format!("gagal baca {}", canon.display()))?;
         let text = String::from_utf8_lossy(&bytes).to_string();
         let total = text.chars().count();
-
-        if total > FILE_THRESHOLD_CHARS {
-            let fname = canon
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file.txt".into());
-            let doc = InputFile::memory(text.clone().into_bytes()).file_name(fname);
-            let _ = self
-                .bot
-                .send_document(ChatId(chat_id), doc)
-                .caption(format!("📄 {} ({} char)", canon.display(), total))
-                .await;
-        }
 
         Ok(format!(
             "📄 {} ({} char):\n{}",
@@ -523,7 +493,7 @@ fn tail_chars(s: &str, n: usize) -> String {
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     format!(
-        "…(dipotong — {total} char total, tampilkan {n} terakhir; versi penuh dikirim sebagai file)\n{}",
+        "…(dipotong — {total} char total, tampilkan {n} terakhir — butuh bagian lain? jalankan ulang dengan grep/head/tail)\n{}",
         &s[start..]
     )
 }
@@ -538,11 +508,7 @@ fn head_chars(s: &str, n: usize) -> String {
         .nth(n)
         .map(|(i, _)| i)
         .unwrap_or(s.len());
-    format!("{}…(dipotong — {total} char total; versi penuh dikirim sebagai file)", &s[..end])
-}
-
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
+    format!("{}…(dipotong — {total} char total — butuh bagian lain? minta baca bagian spesifik)", &s[..end])
 }
 
 /// Deteksi command yang membunuh/menulis binary agent sendiri (insiden 30-31 Agu

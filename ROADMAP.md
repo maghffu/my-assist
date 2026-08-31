@@ -94,14 +94,14 @@ cargo build          # ✅ hijau (2 m 21s first build)
 ## Fase 4 — Shell Access (Pilar 9)
 
 - `run_command` (`bash -lc`, cwd tracking, timeout 120s + kill process group), `read_file`/`write_file` (path guard)
-- Confirmation gate inline keyboard untuk destructive pattern; output > ~4000 char → `send_document`
+- Confirmation gate inline keyboard untuk destructive pattern; output di-truncate (tail ±2K char ke context) — **tanpa file attachment** (revisi owner: truncate-only)
 - Audit `command_logs`; secret masking
 - **Catatan dev:** eksekusi shell di Windows dev beda dari VPS Linux — implement target Linux (`bash`), test penuh saat deploy
 
 ## Fase 5 — Web & Image (Pilar 10 + 12)
 
 - ✅ `SEARCH_PROVIDER` abstraction (trait `SearchProvider`) + Tavily primary; tanpa key → tool balas pesan konfigurasi (bot tetap jalan)
-- ✅ `fetch_url` chain 4-tier (`Accept: text/markdown` → markdown.new → r.jina.ai → HTML strip lokal) + SSRF guard dua lapis (pre-check DNS + custom resolver reqwest yang berlaku juga utk redirect) + size cap 2MB/request, context 15K char, versi penuh jadi file attachment
+- ✅ `fetch_url` chain 4-tier (`Accept: text/markdown` → markdown.new → r.jina.ai → HTML strip lokal) + SSRF guard dua lapis (pre-check DNS + custom resolver reqwest yang berlaku juga utk redirect) + size cap 2MB/request, context 15K char truncate-only (revisi owner: tanpa file attachment)
 - ✅ `generate_image` via Pollinations → `send_photo` (timeout 60s, konfirmasi teks ke LLM)
 - Env baru: `SEARCH_PROVIDER`, `TAVILY_API_KEY`, `FETCH_TIMEOUT=30`, `IMAGE_TIMEOUT=60`
 - Integration test network: `cargo test -- --ignored`

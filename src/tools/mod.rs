@@ -75,7 +75,9 @@ pub fn definitions() -> Vec<ToolDef> {
                 kalau ditolak/timeout, laporkan dan JANGAN ulangi sendiri. Timeout eksekusi \
                 120 detik; command interaktif (perlu input stdin) tidak didukung — pakai flag \
                 non-interaktif (-y, DEBIAN_FRONTEND=noninteractive). Output panjang otomatis \
-                dikirim sebagai file ke owner."
+                dipotong — hanya bagian akhir (tail) yang terlihat; kalau hasil berpotensi \
+                panjang (log, dump SQL, ls besar), pipe dari awal: `| head -n 50`, `| tail`, \
+                `grep`, atau `LIMIT` di SQL — jangan dump semua lalu filter belakangan."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -92,7 +94,8 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "read_file".into(),
             description: "Baca isi file dari disk. Path absolut, atau relatif terhadap \
                 workdir utama. Hanya di dalam direktori yang diizinkan. File besar otomatis \
-                dikirim sebagai file ke owner. Lebih hemat & aman daripada cat via shell."
+                dipotong (hanya awalnya yang terbaca) — untuk file besar minta baca bagian \
+                spesifik saja. Lebih hemat & aman daripada cat via shell."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -144,8 +147,8 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "fetch_url".into(),
             description: "Ambil isi sebuah URL publik sebagai teks/markdown bersih. Gunakan \
                 setelah web_search kalau perlu isi halaman penuh (dokumentasi, artikel, changelog). \
-                Konten > 15 ribu karakter otomatis dipotong untuk context; versi penuh dikirim \
-                ke owner sebagai file. Hanya URL publik http/https — bukan IP internal/localhost."
+                Konten > 15 ribu karakter otomatis dipotong (hanya awalnya). Hanya URL publik \
+                http/https — bukan IP internal/localhost."
                 .into(),
             input_schema: json!({
                 "type": "object",
