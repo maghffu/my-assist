@@ -28,6 +28,8 @@ pub struct Config {
     pub search_provider: String,
     /// API key Tavily — tanpa ini tool web_search balas pesan konfigurasi.
     pub tavily_api_key: Option<String>,
+    /// API key Jina (opsional) — naikkan rate limit s.jina.ai di atas keyless.
+    pub jina_api_key: Option<String>,
     /// Timeout per request fetch_url (detik).
     pub fetch_timeout: u64,
     /// Timeout generate_image (detik) — generasi gambar bisa lambat.
@@ -101,10 +103,18 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600), // 10 menit — owner bisa keburu jauh dari HP
-            search_provider: env::var("SEARCH_PROVIDER")
-                .unwrap_or_else(|_| "tavily".into())
-                .to_ascii_lowercase(),
+            search_provider: {
+                let p = env::var("SEARCH_PROVIDER")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if p.is_empty() { "jina".to_string() } else { p }
+            },
             tavily_api_key: env::var("TAVILY_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            jina_api_key: env::var("JINA_API_KEY")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),

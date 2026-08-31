@@ -137,7 +137,8 @@ Menutup celah **knowledge cutoff** LLM — tanpa web access, agent buta terhadap
 **Kenapa tool dedicated, bukan via `run_command` + curl:** hasil terstruktur dari API jauh lebih hemat token dibanding HTML mentah; search adalah operasi read-only yang aman secara default (tidak perlu confirmation gate); dan pemisahan concern memudahkan rate-limit/audit per capability.
 
 **Search backend — swappable via `SEARCH_PROVIDER` (pola sama seperti `AI_PROVIDER`):**
-- **MVP primary: Tavily** — dibangun khusus untuk LLM agent, return konten LLM-ready (sering tidak perlu fetch URL terpisah = hemat token), free tier ±1000 credit/bulan — cukup jauh untuk single-user
+- **Default: `jina` (s.jina.ai keyless)** — tier-1: nol setup, SERP dirender di sisi Jina, nol resource VPS; keyless ±20 RPM — naikkan via `JINA_API_KEY` (gratis, daftar jina.ai); request pakai header `X-Respond-With: no-content` (snippet-only, hemat token)
+- **Alternatif: Tavily** — dibangun khusus untuk LLM agent, return konten LLM-ready (sering tidak perlu fetch URL terpisah = hemat token), free tier ±1000 credit/bulan — cukup jauh untuk single-user
 - Alternatif yang disupport: `brave` (JSON stabil, free tier ±2000 query/bulan), `google_cse` (100/hari), `ddg_scrape` (zero-key, hanya untuk darurat — datacenter IP mudah kena CAPTCHA/block, terverifikasi saat riset)
 - Bing Search API sudah pensiun — tidak dipertimbangkan
 

@@ -1,7 +1,7 @@
 //! Web access (Pilar 10 + 12, ROADMAP Fase 5): `web_search` + `fetch_url` + `generate_image`.
 //!
 //! - **web_search** — abstraction `SearchProvider` (dipilih via `SEARCH_PROVIDER`, pola
-//!   sama seperti `AI_PROVIDER`); MVP primary: Tavily (konten LLM-ready, hemat token).
+//!   sama seperti `AI_PROVIDER`); default: jina (s.jina.ai keyless — tier 1), alternatif: tavily (butuh TAVILY_API_KEY).
 //! - **fetch_url** — chain 4-tier (AGENTS.md Pilar 10): direct fetch `Accept: text/markdown`
 //!   → markdown.new → r.jina.ai (keyless) → plain HTML + strip lokal. SSRF guard via custom
 //!   DNS resolver yang menolak IP private/reserved — berlaku juga utk redirect target.
@@ -316,14 +316,102 @@ pub fn build_search_provider(cfg: &Config) -> Arc<dyn SearchProvider> {
     };
     match cfg.search_provider.as_str() {
         "tavily" => tavily(),
+        "jina" => {
+            Arc::new(JinaProvider {
+                http: reqwest::Client::new(),
+                api_key: cfg.jina_api_key.clone(),
+            }) as Arc<dyn SearchProvider>
+        }
         // Backend lain (brave, google_cse, ddg_scrape) menyusul kalau terbukti perlu.
         other => {
             tracing::warn!(
-                "SEARCH_PROVIDER tidak dikenal: {other:?} — fallback ke tavily (satu-satunya backend saat ini)"
+                "SEARCH_PROVIDER tidak dikenal: {other:?} — fallback ke tavily"
             );
             tavily()
         }
     }
+}
+
+/// Jina Search (s.jina.ai) — tier 1 default: keyless, nol setup, SERP dirender di
+/// sisi Jina (nol resource VPS). Rate limit keyless ketat (±20 RPM) — set
+/// JINA_API_KEY (gratis, daftar jina.ai) kalau butuh lebih. Header
+/// `X-Respond-With: no-content` = tanpa full content halaman (hemat bandwidth,
+/// respons cepat); snippet diambil dari description.
+struct JinaProvider {
+    http: reqwest::Client,
+    api_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JinaSearchResponse {
+    data: Option<Vec<JinaSearchItem>>,
+}
+
+#[derive(Deserialize)]
+struct JinaSearchItem {
+    title: Option<String>,
+    url: Option<String>,
+    description: Option<String>,
+    content: Option<String>,
+}
+
+#[async_trait]
+impl SearchProvider for JinaProvider {
+    fn name(&self) -> &'static str {
+        "jina"
+    }
+
+    async fn search(&self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+        let mut req = self
+            .http
+            .get(format!("https://s.jina.ai/?q={}", urlencode(query)))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header("X-Respond-With", "no-content")
+            .timeout(SEARCH_TIMEOUT);
+        if let Some(key) = self.api_key.as_deref() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.context("gagal memanggil s.jina.ai")?;
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            bail!(
+                "s.jina.ai rate limit (keyless ±20 RPM) — tunggu ±1 menit, \
+                 atau set JINA_API_KEY di .env (gratis, daftar jina.ai)"
+            );
+        }
+        if !status.is_success() {
+            bail!("s.jina.ai HTTP {status}");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        parse_jina_body(&body, max_results)
+    }
+}
+
+fn parse_jina_body(body: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+    let parsed: JinaSearchResponse =
+        serde_json::from_str(body).context("respons s.jina.ai bukan JSON yang diharapkan")?;
+    Ok(parsed
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .take(max_results)
+        .map(|r| {
+            let snippet = r
+                .description
+                .filter(|d| !d.trim().is_empty())
+                .or_else(|| {
+                    r.content
+                        .as_deref()
+                        .map(|c| truncate_chars(c, SNIPPET_MAX_CHARS))
+                })
+                .unwrap_or_default();
+            SearchResult {
+                title: r.title.unwrap_or_else(|| "(tanpa judul)".into()),
+                url: r.url.unwrap_or_default(),
+                snippet,
+            }
+        })
+        .collect())
 }
 
 struct TavilyProvider {
