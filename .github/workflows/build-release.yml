@@ -166,15 +166,23 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # job ini tanpa checkout — gh butuh repo eksplisit
+          GH_REPO: ${{ github.repository }}
         run: |
-          SHA8="${GITHUB_SHA::8}"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "$GITHUB_REF_NAME" --notes "Build $GITHUB_REF_NAME ($SHA8)"
-          else
-            # channel nightly: release lama dibuang, tag dipindah ke commit terbaru
-            gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
-            gh release create nightly dist/* \
-              --target "$GITHUB_SHA" --title "nightly $SHA8" \
-              --notes "Auto-build main @ ${SHA8}"
-          fi
+          set -o pipefail
+          publish() {
+            SHA8="${GITHUB_SHA::8}"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              gh release create "$GITHUB_REF_NAME" dist/* \
+                --title "$GITHUB_REF_NAME" --notes "Build $GITHUB_REF_NAME ($SHA8)"
+            else
+              # channel nightly: release lama dibuang, tag dipindah ke commit terbaru
+              gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
+              gh release create nightly dist/* \
+                --target "$GITHUB_SHA" --title "nightly $SHA8" \
+                --notes "Auto-build main @ ${SHA8}"
+            fi
+          }
+          publish > /tmp/rel.log 2>&1 \
+            || { echo "::error::RELEASE: $(tail -c 600 /tmp/rel.log | tr '\n' ' ')"; exit 1; }
+          cat /tmp/rel.log
