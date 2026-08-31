@@ -35,7 +35,7 @@ jobs:
       # melihat path yang di-bind-mount, bukan filesystem container).
       CARGO_HOME: ${{ github.workspace }}/.cargo-home
       RUSTUP_HOME: /usr/local/rustup
-      PKG_CONFIG_PATH: /opt/tess/lib64/pkgconfig
+      PKG_CONFIG_PATH: /opt/tess/lib64/pkgconfig:/opt/tess/lib/pkgconfig
     steps:
       - uses: actions/checkout@v5
 
@@ -58,7 +58,7 @@ jobs:
 
       - name: Build leptonica 1.84.0 + tesseract 5.3.2 dari source (sekali, cached)
         run: |
-          if [[ -f /opt/tess/lib64/pkgconfig/tesseract.pc ]]; then
+          if ls /opt/tess/lib*/pkgconfig/tesseract.pc >/dev/null 2>&1; then
             echo "cache hit — skip source build"; exit 0
           fi
           set -e
