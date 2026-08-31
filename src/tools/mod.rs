@@ -273,7 +273,25 @@ pub async fn execute(
                 Some("inferred") => "inferred",
                 _ => "explicit",
             };
-            memory::save_fact(pool, chat_id, &fact, fact_type).await
+            // Memory v2 — save filter: tolak entri transien/trivial sebelum masuk DB.
+            if fact_type == "inferred" && memory::is_transient_fact(&fact) {
+                return Ok(format!(
+                    "\u{2139}\u{fe0f} Entri dilewati save filter (transien/trivial): {fact}"
+                ));
+            }
+            // Semantik-dedup: near-duplicate -> UPDATE entri lama, bukan INSERT baru.
+            if let Some(id) = memory::find_near_duplicate(pool, chat_id, &fact).await? {
+                memory::update_fact(pool, chat_id, id, &fact).await?;
+                return Ok(format!(
+                    "\u{2705} Memory diperbarui (duplikat digabung ke id {id}): {fact}"
+                ));
+            }
+            let res = memory::save_fact(pool, chat_id, &fact, fact_type).await;
+            // Warning save-gagal TIDAK boleh diam-diam: log + lempar error ke owner.
+            if let Err(e) = &res {
+                tracing::warn!(chat_id, "save_memory GAGAL: {e:#}");
+            }
+            res
         }
         "run_command" => {
             let command = input["command"].as_str().unwrap_or("").trim().to_string();

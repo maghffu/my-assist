@@ -115,7 +115,8 @@ impl Agent {
     ) -> Result<String> {
         context::save_message(&self.pool, chat_id, "user", user_text).await?;
 
-        let facts = memory::facts_for_prompt(&self.pool, chat_id).await?;
+        // Memory v2: recall selectif — explicit selalu, inferred hanya FTS match pesan user.
+        let facts = memory::recall_facts(&self.pool, chat_id, user_text).await?;
         let system = self.build_system_prompt(&facts, user_text);
 
         let mut messages: Vec<ApiMessage> = if include_history {

@@ -91,13 +91,39 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         let agent = agent.clone();
         tokio::spawn(async move {
             let period = Duration::from_secs(7 * 24 * 3600);
+            // Dream timer kebal restart (memory v2): last_run dipersist ke agent_state.
+            // Pasca-restart, next fire dihitung dari last_run — bukan reset +7 hari penuh.
+            let last_run: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                "SELECT value::timestamptz FROM agent_state WHERE key = 'dream_last_run'",
+            )
+            .fetch_optional(&agent.pool)
+            .await
+            .ok()
+            .flatten();
+            let now = chrono::Utc::now();
+            let elapsed_secs = last_run
+                .map(|t| (now - t).num_seconds().max(0) as u64)
+                .unwrap_or(period.as_secs());
+            let run_now = elapsed_secs >= period.as_secs();
+            let first_delay = if run_now {
+                Duration::from_secs(30) // kasih waktu service settle dulu
+            } else {
+                Duration::from_secs(period.as_secs() - elapsed_secs)
+            };
+            tracing::info!(?last_run, run_now, "dreaming cycle dijadwalkan");
             let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + period,
+                tokio::time::Instant::now() + first_delay,
                 period,
             );
             loop {
                 interval.tick().await;
                 tracing::info!("dreaming cycle mingguan terpicu");
+                let _ = sqlx::query(
+                    "INSERT INTO agent_state (key, value) VALUES ('dream_last_run', now()::text)
+                     ON CONFLICT (key) DO UPDATE SET value = now()::text, updated_at = now()",
+                )
+                .execute(&agent.pool)
+                .await;
                 match review::run_dream(&agent).await {
                     Ok(_) => {} // ringkasan sudah di-log run_dream
                     Err(e) => tracing::error!("dreaming cycle error: {e:#}"),
