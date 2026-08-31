@@ -14,8 +14,15 @@ use std::time::Instant;
 
 /// Guard anti-loop: maksimum iterasi tool-calling per turn. 8 terbukti kurang
 /// untuk task multi-langkah (uninstall package = stop/remove/verify, dst.) —
-/// agent berhenti diam-diam padahal tugas belum selesai.
-const MAX_TOOL_ITERATIONS: usize = 16;
+/// agent berhenti diam-diam padahal tugas belum selesai. 16→50 (31 Agu 2026):
+/// task build+deploy+verify panjang (menunggu cargo build via poll) butuh >16
+/// langkah — terpotong memaksa fragmentasi turn (owner harus bilang "lanjut").
+/// Tradeoff: worst-case token spend per turn naik ~3x — diterima karena self-harm
+/// guard (shell.rs) sudah memblokir jalur bunuh-diri yang dulu muncul di turn panjang.
+/// CATATAN: limit ini BUKAN penyebab insiden self-kill 30-31 Agu (bot mati di
+/// tool call ke-4, jauh dari batas apapun) — jangan naikkan lagi demi "mencegah
+/// crash"; untuk itu ada guard + Restart=always.
+const MAX_TOOL_ITERATIONS: usize = 50;
 /// Batas panjang pesan yang dipersist ke history (jaga tabel messages ramping).
 const MAX_SAVED_CHARS: usize = 8000;
 

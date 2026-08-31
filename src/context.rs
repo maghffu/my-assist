@@ -41,3 +41,13 @@ pub async fn recent_messages(
         .map(|(role, content)| ChatMessage { role, content })
         .collect())
 }
+
+/// Hapus seluruh riwayat percakapan satu chat (command /new — reset session).
+/// Memory & skills = tabel berbeda, tidak tersentuh (identitas agent tetap).
+pub async fn clear_messages(pool: &PgPool, chat_id: i64) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM messages WHERE chat_id = $1")
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}

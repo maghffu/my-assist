@@ -1,15 +1,16 @@
 # Deploy & Ops Manual — Hermes-Lite di VPS
 
 Dokumentasi setup produksi (ROADMAP Fase 8). Target: VPS Linux RHEL-like
-(terverifikasi di OpenCloudOS 9.6). Prinsip: satu proses, unprivileged user,
-systemd + journald.
+(terverifikasi di OpenCloudOS 9.6). Prinsip: satu proses, systemd + journald.
+**Mode root (keputusan owner)** — service berjalan sebagai root, tanpa sandbox
+systemd; detail risiko & mitigasi lihat bagian Keamanan di bawah.
 
 ## Layout
 
 | Path | Isi |
 |---|---|
 | `/opt/hermes-lite/hermes-lite` | Binary (release) — di-update oleh `deploy.sh` |
-| `/opt/hermes-lite/.env` | Konfigurasi + secret (chmod 600, owner `hermes`) |
+| `/opt/hermes-lite/.env` | Konfigurasi + secret (chmod 600, owner `root`) |
 | `/opt/hermes-lite/soul.md` | Persona — di-update dari repo oleh `deploy.sh` |
 | `/opt/hermes-lite/skills/` | Skill library (Pilar 11) — ditulis runtime, **tidak** dioverwrite deploy |
 | `/root/my-assist` | Repo source (dev) |
@@ -64,18 +65,26 @@ setelah itu edit langsung di `/opt/hermes-lite/.env`.
 | Update versi | `cd /root/my-assist && git pull && sudo ./deploy/deploy.sh` |
 | Edit persona | edit `soul.md` di repo → deploy lagi |
 | Edit config | edit `/opt/hermes-lite/.env` → `systemctl restart hermes-lite` |
-| Migrasi manual | `sudo -u hermes /opt/hermes-lite/hermes-lite migrate` |
+| Migrasi manual | `/opt/hermes-lite/hermes-lite migrate` |
 
-## Keamanan (Pilar 9)
+## Keamanan (Pilar 9) — MODE ROOT
 
-- Bot jalan sebagai user `hermes` (nologin shell, tanpa capability, `ProtectSystem=strict`
-  — FS read-only kecuali `/opt/hermes-lite` + `/tmp` private)
+**Keputusan owner (revisi desain awal):** service berjalan sebagai **root** supaya
+agent mampu mengerjakan workflow admin + coding penuh tanpa sudoers allowlist
+per-command. Sandbox unprivileged & `MemoryMax` dinonaktifkan (cargo/rustc via
+`run_command` dihitung dalam cgroup dan mudah >512M → OOM-kill; monitoring
+resource manual via `/status`). Risiko yang disadari & diterima: indirect prompt
+injection via web/OCR → root RCE; kebocoran token bot = root RCE.
+
+Mitigasi yang tetap aktif:
 - Allowlist `ALLOWED_CHAT_ID` di-drop level gateway — pesan luar tidak diproses
-- Kebocoran token bot = RCE di user `hermes` — karenanya: `.env` 0600, sandbox, audit
-  `command_logs`. Sudoers/docker group TIDAK diberikan (evidence-driven — tambahkan
-  allowlist spesifik saja kalau owner terbukti butuh, mis:
-  `hermes ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx`)
-- MemoryMax=512M (guard OCR spike di VPS kecil)
+- Confirmation gate destructive pattern (✅ sekali / 🔁 sesi / ❌ tolak, via inline keyboard)
+- Audit `command_logs` + secret masking di output yang dikirim ke Telegram
+- `WORK_ROOTS` membatasi `read_file`/`write_file` + cwd awal (`run_command` bebas)
+- Timeout per command (`RUN_CMD_TIMEOUT`) + kill process group saat timeout
+
+User sistem `hermes` warisan deploy lama dibiarkan (nologin, tidak dipakai) —
+artifacts sudah di-chown root oleh `deploy.sh`.
 
 ## Backup
 

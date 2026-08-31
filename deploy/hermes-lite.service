@@ -1,13 +1,36 @@
 # Hermes-Lite — systemd unit (ROADMAP Fase 8)
 # Install: cp deploy/hermes-lite.service /etc/systemd/system/ && systemctl daemon-reload
 #
-# Hardening (AGENTS.md Pilar 9 keamanan #2):
-# - Dedicated unprivileged user `hermes` (bukan root), tanpa capability
-# - ProtectSystem=strict: seluruh FS read-only KECUALI /opt/hermes-lite (skills,
-#   write_file) dan /tmp (PrivateTmp — per-service, tak terlihat proses lain)
-# - bash -l utk run_command tetap jalan (read /etc/profile cukup, non-interaktif)
-# - Vault Obsidian owner (/opt/vault + bare repo /opt/vault.git) — owner akses via
-#   SSH laptop lewat symlink /root/vault; agent edit wajib commit+push (Pilar 11 style)
+# KEPUTUSAN OWNER — MODE ROOT (revisi dari desain awal Pilar 9 keamanan #2):
+# Service dijalankan sebagai root agar agent benar-benar bisa mengerjakan workflow
+# admin + coding penuh (systemctl, dnf, docker, cargo build di /root/my-assist,
+# edit /etc, dst) tanpa sudoers allowlist per-command.
+#
+# Konsekuensi yang disadari & diterima owner:
+# - Sandbox systemd dinonaktifkan total (ProtectSystem/ProtectHome/caps/PrivateTmp)
+# - Indirect prompt injection via web/OCR (Pilar 7+10 → context → run_command)
+#   berujung root RCE — mitigasi tersisa ada di lapisan aplikasi, bukan OS
+# - Mitigasi yang TETAP aktif: allowlist ALLOWED_CHAT_ID, confirmation gate
+#   destructive pattern, audit command_logs, secret masking, RUN_CMD_TIMEOUT
+#
+# Catatan lain:
+# - HOME=/root + bash -l → PATH termasuk /root/.cargo/bin (agent bisa cargo build)
+# - WORK_ROOTS di .env menentukan scope read_file/write_file + cwd awal
+#   run_command (dipasang: /root/my-assist,/opt/hermes-lite,/opt/vault);
+#   run_command sendiri tetap bebas cd/akses path mana pun
+# - MemoryMax sengaja TIDAK dipasang: cargo/rustc via run_command dihitung dalam
+#   cgroup dan mudah >512M → OOM-kill. Monitoring resource manual via /status
+# - Vault Obsidian (/opt/vault + bare repo /opt/vault.git) kini accessible native;
+#   aturan tetap: edit vault wajib commit+push (Pilar 11 style)
+#
+# KEPUTUSAN 31 Agu 2026 — Restart=always (dulu on-failure): menutup celah "mati
+# bersih tapi tidak bangkit" (exit code 0 / SIGTERM bersih dari proses lain).
+# Insiden 30-31 Agu (agent systemctl stop dirinya sendiri) TIDAK terselamatkan
+# oleh setting ini — explicit `systemctl stop` memang tidak pernah auto-restart
+# (by design, admin action). Pencegahan insiden itu = self-harm guard di shell.rs;
+# unit ini hanya lapisan cadangan untuk kematian spontan (panic/OOM/self-pkill/
+# exit bersih tak sengaja). Start rate-limit default systemd tetap berlaku
+# (5 start / 10s → failed) sehingga tidak ada restart-loop tak terkendali.
 
 [Unit]
 Description=Hermes-Lite — personal AI agent (Telegram)
@@ -16,35 +39,14 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=hermes
-Group=hermes
+User=root
+Group=root
 WorkingDirectory=/opt/hermes-lite
 ExecStart=/opt/hermes-lite/hermes-lite
-Restart=on-failure
+Restart=always
 RestartSec=5
 UMask=0027
-
-# Resource guard (VPS kecil: tesseract eng+ind bisa spike ~300MB saat OCR)
-MemoryMax=512M
 LimitNOFILE=65536
-
-# Sandbox
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/hermes-lite /tmp /opt/vault /opt/vault.git
-PrivateTmp=true
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-LockPersonality=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictRealtime=true
-RestrictSUIDSGID=true
-CapabilityBoundingSet=
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -14,17 +14,19 @@ echo "==> Build release…"
 cd "$REPO_DIR"
 cargo build --release
 
-echo "==> Siapkan user & direktori…"
-id -u hermes >/dev/null 2>&1 || useradd -r -d "$APP_DIR" -s /sbin/nologin hermes
-install -d -o hermes -g hermes -m 0750 "$APP_DIR"
+echo "==> Siapkan direktori…"
+# Mode root (keputusan owner — lihat hermes-lite.service): artifacts milik root.
+# chown menutup artifacts warisan deploy lama yang masih milik user `hermes`.
+chown -R root:root "$APP_DIR"
+install -d -m 0750 "$APP_DIR"
 
 echo "==> Salin artifacts…"
-install -o hermes -g hermes -m 0755 target/release/hermes-lite "$APP_DIR/hermes-lite"
-install -o hermes -g hermes -m 0644 soul.md "$APP_DIR/soul.md"
-[[ -d "$APP_DIR/skills" ]] || install -d -o hermes -g hermes -m 0755 "$APP_DIR/skills"
+install -m 0755 target/release/hermes-lite "$APP_DIR/hermes-lite"
+install -m 0644 soul.md "$APP_DIR/soul.md"
+[[ -d "$APP_DIR/skills" ]] || install -d -m 0755 "$APP_DIR/skills"
 if [[ ! -f "$APP_DIR/.env" ]]; then
     if [[ -f "$REPO_DIR/.env" ]]; then
-        install -o hermes -g hermes -m 0600 "$REPO_DIR/.env" "$APP_DIR/.env"
+        install -m 0600 "$REPO_DIR/.env" "$APP_DIR/.env"
         echo "    .env disalin (0600) — edit langsung di $APP_DIR/.env ke depannya"
     else
         echo "⚠️  .env tidak ditemukan — salin manual ke $APP_DIR/.env lalu restart service"

@@ -120,7 +120,7 @@ Kemampuan owner menyuruh agent mengeksekusi shell command di VPS — coding, set
 
 **Keamanan — shell access artinya kebocoran token bot = remote code execution, jadi lapisan pertahanan wajib:**
 1. **Hard allowlist `ALLOWED_CHAT_ID`** — pesan dari chat_id di luar allowlist di-drop total, tidak diproses, tidak masuk history
-2. Proses bot berjalan sebagai **dedicated unprivileged user**, bukan root; jika butuh privilege tertentu, pakai sudoers allowlist untuk command spesifik (bukan sudo all)
+2. ~~Proses bot berjalan sebagai dedicated unprivileged user~~ — **REVISI KEPUTUSAN OWNER: service dijalankan sebagai root**, agar workflow admin + coding berjalan penuh tanpa friction (systemctl, dnf, docker, cargo build, edit /etc). Risiko indirect prompt injection via web/OCR → root RCE disadari & diterima secara eksplisit. Mitigasi yang tetap aktif: allowlist `ALLOWED_CHAT_ID`, confirmation gate destructive pattern, audit `command_logs`, secret masking, dan `WORK_ROOTS` yang membatasi `read_file`/`write_file` + cwd awal (`run_command` tetap bebas). Jalur downgrade nanti kalau mau lebih aman: sudoers allowlist per-command spesifik
 3. **Confirmation gate untuk destructive pattern** (`rm -rf`, `dd`, `mkfs`, `fdisk`, `chmod -R`, `chown -R`, `reboot`, `curl | sh`, dsb.) — bot kirim inline keyboard konfirmasi ("Approve command?") dulu, eksekusi hanya setelah owner tap approve. Command non-destruktif jalan langsung tanpa konfirmasi (single-user, jangan ganggu flow)
 4. **Audit trail** — semua command tercatat di tabel `command_logs` (chat_id, command, exit_code, duration, created_at)
 5. **Secret masking** — nilai env var / credential tidak boleh bocor ke output yang dikirim ke Telegram (mask `API_KEY=...` style output)

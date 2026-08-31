@@ -1,13 +1,13 @@
 use crate::agent::Agent;
 use crate::notify::Notifier;
 use crate::shell::ConfirmVerdict;
-use crate::{memory, ocr, reminders, review, shell, skills};
+use crate::{context, memory, ocr, reminders, review, shell, skills};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, CallbackQuery, ChatId};
+use teloxide::types::{BotCommand, CallbackQuery, ChatId, Update, UpdateKind, UserId};
 
 /// Pencegah "ngomong sama tembok" versi ekstrem: batas total satu turn. Kalau
 /// semuanya hang (provider, shell, konfirmasi tidak dijawab), turn dibunuh dan
@@ -20,6 +20,7 @@ Chat langsung aja — aku inget konteks & fakta penting tentang kamu. Saat aku \
 kerja (run command, search, dll.), muncul pesan progres tiap langkah.\n\
 \n\
 **Perintah:**\n\
+/new — reset session (hapus riwayat chat ini)\n\
 /status — uptime, provider, model\n\
 /memory — lihat fakta yang kupelajari (/memory del <id> untuk hapus)\n\
 /reminders — daftar pengingat (/reminders del <id> untuk hapus)\n\
@@ -29,10 +30,32 @@ kerja (run command, search, dll.), muncul pesan progres tiap langkah.\n\
 /usage — pemakaian token proses ini\n\
 /help — tulisan ini";
 
+/// Key distribusi update ke worker dispatcher — FIX deadlock confirmation gate.
+/// Default teloxide mengelompokkan update per chat_id: pesan dan callback dari
+/// chat yang sama diantrekan ke SATU worker yang memprosesnya BERURUTAN. Akibatnya
+/// callback tombol approval (dari chat owner, satu-satunya chat allowlist) tidak
+/// pernah sampai ke handler selama run_command sedang menunggu verdict — dia
+/// ngantre di belakang turn yang menunggu jawabannya sendiri → selalu timeout.
+/// Solusi: callback query diberi jalur worker sendiri (key per user id), pesan
+/// tetap sekuensial per chat seperti semula.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+enum DistKey {
+    Chat(ChatId),
+    Callback(UserId),
+}
+
+fn dist_key(upd: &Update) -> Option<DistKey> {
+    match &upd.kind {
+        UpdateKind::CallbackQuery(q) => Some(DistKey::Callback(q.from.id)),
+        _ => upd.chat().map(|c| DistKey::Chat(c.id)),
+    }
+}
+
 pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
     // Sinkron daftar command di menu "/" Telegram — token bot bisa dipakai ulang dari
     // aplikasi lain, jadi daftar lama (warisan) dioverwrite total saat startup.
     let menu = vec![
+        BotCommand::new("new", "reset session — hapus riwayat chat ini"),
         BotCommand::new("help", "bantuan / daftar perintah"),
         BotCommand::new("status", "uptime, provider, model"),
         BotCommand::new("memory", "fakta yang dipelajari (/memory del <id>)"),
@@ -109,6 +132,7 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         );
 
     Dispatcher::builder(bot, handler)
+        .distribution_function(dist_key)
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -456,6 +480,15 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
             // Konsolidasi manual (loop mingguan jalan otomatis; ini utk test/darurat)
             let summary = review::run_dream(agent).await?;
             Ok(format!("💤 Dream selesai:\n{}", summary))
+        }
+
+        "/new" => {
+            // Reset session: hapus riwayat chat ini — context window langsung
+            // kosong tanpa restart. Memory & skills tidak terpengaruh.
+            let deleted = context::clear_messages(&agent.pool, chat_id).await?;
+            Ok(format!(
+                "🆕 Session baru dimulai — {deleted} pesan lama dibuang. Memory & skills tetap aman."
+            ))
         }
 
         other => Ok(format!(

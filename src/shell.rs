@@ -94,8 +94,14 @@ impl ShellCtx {
     }
 
     /// Kirim keyboard 3-tombol (sekali / sesi ini / tolak), lalu tunggu verdict
-    /// owner (oneshot + timeout). Timeout / channel drop = Deny (err ke sisi aman).
-    async fn request_confirmation(&self, chat_id: i64, cmd: &str, reason: &str) -> ConfirmVerdict {
+    /// owner (oneshot + timeout). Return None = timeout / sender drop (dibedakan
+    /// dari Deny eksplisit supaya pesan ke LLM & owner akurat).
+    async fn request_confirmation(
+        &self,
+        chat_id: i64,
+        cmd: &str,
+        reason: &str,
+    ) -> Option<ConfirmVerdict> {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().unwrap().insert(id, tx);
@@ -122,12 +128,8 @@ impl ShellCtx {
             .await;
 
         let msg_id = sent.ok().map(|m| m.id);
-        // timeout() -> Option<Recv>; Recv -> Result; Err (sender drop) dianggap deny.
-        let verdict = tokio::time::timeout(self.confirm_timeout, rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(ConfirmVerdict::Deny);
+        // timeout() -> Option<Recv>; Recv -> Result; None = timeout/channel drop.
+        let verdict = tokio::time::timeout(self.confirm_timeout, rx).await.ok().and_then(|r| r.ok());
 
         // Masih ada di map = tidak pernah dijawab (timeout) → tandai kedaluwarsa
         if msg_id.is_some() && self.pending.lock().unwrap().remove(&id).is_some() {
@@ -155,6 +157,28 @@ impl ShellCtx {
             bail!("parameter 'command' kosong");
         }
 
+        // Self-harm guard (insiden 30-31 Agu 2026, 2x): agent yang men-stop/menulis
+        // binary dirinya sendiri mati di tengah command — cp/start berikutnya tidak
+        // pernah jalan, service mati berjam-jam (SIGTERM bersih → Restart=on-failure
+        // tidak trigger). Hard block: approval pun tetap bunuh diri, jadi TIDAK lewat
+        // confirmation gate.
+        if let Some(reason) = self_harm_reason(cmd) {
+            tracing::warn!(chat_id, cmd, reason, "self-harm guard — command diblokir");
+            self.audit(chat_id, &format!("[SELF-GUARD] {cmd}"), None, 0).await;
+            return Ok(format!(
+                "⛔ DIBLOKIR self-harm guard: {reason}.\n\
+                 Kamu BERJALAN DI DALAM service hermes-lite — men-stop/menulis ulang\n\
+                 binary-nya membunuhmu di tengah command ini. Pola yang benar\n\
+                 (skill: rebuild-deploy-hermes-lite.md):\n\
+                 1) Ganti binary (bukan cp langsung — ETXTBSY):\n\
+                    cp target/release/hermes-lite /opt/hermes-lite/hermes-lite.new && mv -f /opt/hermes-lite/hermes-lite.new /opt/hermes-lite/hermes-lite\n\
+                 2) Restart SELALU detached, dan jadi command TERAKHIR di turn:\n\
+                    nohup bash -c 'sleep 15; systemctl restart hermes-lite' >/tmp/restart.log 2>&1 &\n\
+                 (`systemctl stop hermes-lite` TIDAK PERNAH dibolehkan dari dalam agent —\n\
+                 kalau benar-benar perlu stop total, minta owner menjalankannya manual.)"
+            ));
+        }
+
         // Confirmation gate destructive pattern (keamanan #3) — 3 tombol, dan
         // command yang sudah di-approve "sesi ini" lewat tanpa ditanya lagi.
         if let Some(reason) = destructive_reason(cmd) {
@@ -162,14 +186,19 @@ impl ShellCtx {
             if !already {
                 tracing::warn!(chat_id, cmd, reason, "destructive command — menunggu approval owner");
                 match self.request_confirmation(chat_id, cmd, reason).await {
-                    ConfirmVerdict::Allow => {}
-                    ConfirmVerdict::Always => {
+                    Some(ConfirmVerdict::Allow) => {}
+                    Some(ConfirmVerdict::Always) => {
                         self.session_allow.lock().unwrap().insert(cmd.to_string());
                     }
-                    ConfirmVerdict::Deny => {
+                    Some(ConfirmVerdict::Deny) => {
                         self.audit(chat_id, &format!("[DIBATALKAN] {cmd}"), None, 0).await;
-                        return Ok("❌ Owner menolak / konfirmasi kedaluwarsa — command TIDAK dijalankan. \
+                        return Ok("❌ Owner menolak — command TIDAK dijalankan. \
                             Jangan ulangi sendiri; laporkan ke owner dan tunggu instruksinya.".into());
+                    }
+                    None => {
+                        self.audit(chat_id, &format!("[TIMEOUT] {cmd}"), None, 0).await;
+                        return Ok("⏰ Konfirmasi timeout (tombol tidak dijawab dalam batas waktu) — command TIDAK dijalankan. \
+                            Laporkan ke owner; kalau owner masih mau, dia bisa minta ulang lalu jawab tombolnya.".into());
                     }
                 }
             }
@@ -516,6 +545,57 @@ fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Deteksi command yang membunuh/menulis binary agent sendiri (insiden 30-31 Agu
+/// 2026: `cp` over binary jalan → ETXTBSY → eskalasi `systemctl stop hermes-lite`
+/// → agent mati 13 jam, 2x dalam sehari). Token-based seperti `destructive_reason`,
+/// err ke sisi aman: deteksi longgar (substring), izin ketat (hanya pola detached).
+pub fn self_harm_reason(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_lowercase();
+    // Detached = command tidak ikut mati saat agent di-kill → aman.
+    // nohup/setsid/systemd-run/at-job; mv-rename tidak menyentuh inode aktif → aman.
+    let detached = ["nohup", "setsid", "systemd-run", "at now", "screen ", "tmux "]
+        .iter()
+        .any(|d| lower.contains(d));
+
+    // 1) systemctl <stop|restart|disable|mask|kill> hermes-lite — inline (tidak detached)
+    //    men-kill agent di tengah turn. `is-active`/`status`/`show`/`enable` tidak kena.
+    if lower.contains("systemctl") && lower.contains("hermes-lite") {
+        let lethal = [" stop ", " restart ", " disable ", " mask ", " kill "];
+        // sub-command bisa nempel di awal command atau setelah '&&' / ';' — normalisasi
+        let padded = format!(" {} ", lower.replace('&', " ").replace(';', " ").replace('\n', " "));
+        if lethal.iter().any(|l| padded.contains(l)) && !detached {
+            return Some(
+                "`systemctl stop/restart/disable/mask hermes-lite` dari DALAM agent tanpa wrapper detached — ini membunuh dirimu sendiri di tengah command (cp/start setelahnya tidak pernah jalan)",
+            );
+        }
+    }
+
+    // 2) pkill/killall yang match proses hermes
+    if (lower.contains("pkill") || lower.contains("killall")) && lower.contains("hermes") && !detached
+    {
+        return Some("pkill/killall hermes — proses itu adalah dirimu sendiri");
+    }
+
+    // 3) Tulis ulang binary sendiri via truncate-write (cp/cat/redirect) → ETXTBSY,
+    //    lalu agent biasanya eskalasi ke systemctl stop (insiden nyata).
+    //    Aman: pola .new + mv (rename), `install` (unlink dulu), rsync (temp+rename).
+    let self_bin = "/opt/hermes-lite/hermes-lite";
+    if lower.contains(self_bin)
+        && !detached
+        && !lower.contains(".new")
+        && !lower.contains("install ")
+        && !lower.contains("mv ")
+        && !lower.contains("rsync ")
+        && (lower.contains("cp ") || lower.contains("cat ") || lower.contains(&format!("> {self_bin}")))
+    {
+        return Some(
+            "menulis langsung ke /opt/hermes-lite/hermes-lite (binary yang sedang berjalan) → ETXTBSY/Text file busy",
+        );
+    }
+
+    None
+}
+
 /// Deteksi command destruktif + alasan singkatnya — alasan ditampilkan di pesan
 /// konfirmasi supaya owner tahu KENAPA command ini diminta approve.
 /// Heuristik token-based (tanpa dependency regex) — err ke sisi aman.
@@ -583,6 +663,27 @@ pub fn destructive_reason(cmd: &str) -> Option<&'static str> {
         joined.contains(&format!("> {d}")) || joined.contains(&format!("of={d}"))
     }) {
         return Some("tulis langsung ke block device");
+    }
+
+    // Docker prune — hapus resource docker tak terpakai (container/image/volume/cache)
+    if toks.iter().any(|t| *t == "prune")
+        || joined.contains("system prune")
+        || joined.contains("builder prune")
+        || joined.contains("container prune")
+        || joined.contains("volume prune")
+        || joined.contains("image prune")
+    {
+        return Some("docker prune (hapus resource docker tak terpakai)");
+    }
+
+    // journalctl vacuum — potong log journald
+    if toks.iter().any(|t| *t == "journalctl") && joined.contains("vacuum") {
+        return Some("potong log journald (journalctl --vacuum)");
+    }
+
+    // truncate — kosongkan file (umumnya log)
+    if toks.iter().any(|t| *t == "truncate") {
+        return Some("truncate file (kosongkan isi file)");
     }
 
     // curl/wget di-pipe ke shell
@@ -683,6 +784,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn self_harm_detection() {
+        // Insiden nyata 30-31 Agu 2026
+        assert!(self_harm_reason(
+            "cp /root/my-assist/target/release/hermes-lite /opt/hermes-lite/hermes-lite && systemctl restart hermes-lite && sleep 2 && systemctl is-active hermes-lite"
+        ).is_some());
+        assert!(self_harm_reason(
+            "systemctl stop hermes-lite"
+        ).is_some());
+        // pkill/killall diri sendiri
+        assert!(self_harm_reason("pkill -f hermes-lite").is_some());
+        assert!(self_harm_reason("killall hermes-lite").is_some());
+        // cat redirect ke binary sendiri
+        assert!(self_harm_reason("cat new.bin > /opt/hermes-lite/hermes-lite").is_some());
+
+        // Pola BENAR dari skill — tidak boleh kena
+        assert!(self_harm_reason(
+            "cp target/release/hermes-lite /opt/hermes-lite/hermes-lite.new && mv -f /opt/hermes-lite/hermes-lite.new /opt/hermes-lite/hermes-lite"
+        ).is_none());
+        assert!(self_harm_reason(
+            "nohup bash -c 'sleep 15; systemctl restart hermes-lite' >/tmp/restart.log 2>&1 &"
+        ).is_none());
+        assert!(self_harm_reason("install -m 0755 target/release/hermes-lite /opt/hermes-lite/hermes-lite").is_none());
+
+        // Operasi sehat sehari-hari — tidak boleh kena
+        assert!(self_harm_reason("systemctl is-active hermes-lite").is_none());
+        assert!(self_harm_reason("systemctl status hermes-lite").is_none());
+        assert!(self_harm_reason("systemctl restart nginx").is_none());
+        assert!(self_harm_reason("systemctl enable hermes-lite").is_none());
+        assert!(self_harm_reason("journalctl -u hermes-lite -n 50").is_none());
+        assert!(self_harm_reason("cp /tmp/a.txt /tmp/b.txt").is_none());
+        assert!(self_harm_reason("cat /opt/hermes-lite/soul.md").is_none());
+    }
+
+    #[test]
     fn destructive_detection() {
         assert!(destructive_reason("rm -rf /tmp/x").is_some());
         assert!(destructive_reason("sudo rm -fr /tmp/x").is_some());
@@ -752,5 +887,18 @@ mod tests {
             destructive_reason("chmod -R 777 /var/www"),
             Some("ubah izin rekursif (chmod -R)")
         );
+        assert_eq!(
+            destructive_reason("docker system prune -af --volumes"),
+            Some("docker prune (hapus resource docker tak terpakai)")
+        );
+        assert_eq!(
+            destructive_reason("journalctl --vacuum-size=200M"),
+            Some("potong log journald (journalctl --vacuum)")
+        );
+        assert_eq!(
+            destructive_reason("truncate -s 0 /var/log/messages"),
+            Some("truncate file (kosongkan isi file)")
+        );
+        assert_eq!(destructive_reason("docker ps"), None);
     }
 }
