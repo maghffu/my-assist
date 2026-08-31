@@ -120,7 +120,13 @@ jobs:
           restore-keys: cargo-oc9-
 
       - name: Build
-        run: cargo build --release --locked
+        run: |
+          echo '--- /opt/tess contents ---'
+          find /opt/tess \( -name '*.pc' -o -name '*.so*' \) | head -20
+          pkg-config --modversion tesseract lept || true
+          cargo build --release --locked > /tmp/cargo.log 2>&1 \
+            || { echo "::error::CARGO: $(tail -c 900 /tmp/cargo.log | tr '\n' ' ')"; exit 1; }
+          tail -n 5 /tmp/cargo.log
 
       - name: Sanity check linkage
         run: |
