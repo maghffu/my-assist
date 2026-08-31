@@ -1,0 +1,17 @@
+# Repo OpenCloudOS 9 publik — dipakai CI (container rockylinux:9) untuk install
+# tesseract-devel & leptonica-devel versi EXACT sama dengan VPS (build .oc9),
+# sehingga DT_NEEDED binary CI identik dengan runtime VPS.
+# cost tinggi (default 1000) supaya paket yg juga ada di Rocky diambil dari Rocky.
+[oc9-baseos]
+name=OpenCloudOS 9 BaseOS (publik)
+baseurl=https://mirrors.opencloudos.tech/opencloudos/9/BaseOS/x86_64/os/
+enabled=1
+cost=2000
+gpgcheck=0
+
+[oc9-appstream]
+name=OpenCloudOS 9 AppStream (publik)
+baseurl=https://mirrors.opencloudos.tech/opencloudos/9/AppStream/x86_64/os/
+enabled=1
+cost=2000
+gpgcheck=0

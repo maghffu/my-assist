@@ -1,0 +1,116 @@
+name: build-release
+
+# CI deploy Hermes-Lite (menggantikan cargo build di VPS — Pilar workflow baru):
+#   push ke main  -> release tag "nightly" (channel default VPS)
+#   push tag v*   -> release stabil
+# VPS men-poll release via deploy/poll-deploy.sh (systemd timer) — tanpa secrets.
+#
+# Build di container rockylinux:9 (glibc 2.34, aman turun ke VPS OpenCloudOS 9 /
+# glibc 2.38). tesseract & leptonica dipasang dari repo oc9 publik dengan versi
+# EXACT sama seperti di VPS (tesseract-devel-5.3.2-8.oc9) supaya DT_NEEDED
+# binary identik — tidak perlu patchelf / symlink hack.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    env:
+      # Di dalam workspace supaya bisa di-cache actions/cache (host hanya
+      # melihat path yang di-bind-mount, bukan filesystem container).
+      CARGO_HOME: ${{ github.workspace }}/.cargo-home
+      RUSTUP_HOME: /usr/local/rustup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          dnf -y install gcc gcc-c++ clang openssl-devel pkg-config curl tar >/dev/null
+          install -m 0644 deploy/oc9-appstream.repo /etc/yum.repos.d/
+          dnf -y --setopt=install_weak_deps=False install \
+              tesseract-devel-5.3.2-8.oc9 leptonica-devel-1.84.0-3.oc9
+
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            target
+          key: cargo-oc9-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-oc9-
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Sanity check linkage (harus libtesseract.so.5.3.2 persis spt VPS)
+        run: |
+          objdump -p target/release/hermes-lite \
+            | grep NEEDED | grep -E 'tesseract|leptonica|ssl|crypto' || true
+          objdump -p target/release/hermes-lite | grep -q 'libtesseract.so.5.3.2' \
+            || { echo '❌ DT_NEEDED tesseract tidak match VPS'; exit 1; }
+
+      - name: Package tarball
+        run: |
+          SHA8="${GITHUB_SHA::8}"
+          NAME="hermes-lite-${SHA8}-linux-x86_64"
+          mkdir -p dist
+          { echo "commit: ${GITHUB_SHA}"
+            echo "ref:    ${GITHUB_REF_NAME}"
+            echo "built:  $(date -u +%FT%TZ)"
+          } > dist/BUILD_INFO
+          cp target/release/hermes-lite       dist/
+          cp deploy/install-release.sh        dist/install.sh
+          cp soul.md deploy/hermes-lite.service dist/
+          tar -C dist -czf "dist/${NAME}.tar.gz" \
+              hermes-lite install.sh soul.md hermes-lite.service BUILD_INFO
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-tarball
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tarball
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA8="${GITHUB_SHA::8}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --notes "Build $GITHUB_REF_NAME ($SHA8)"
+          else
+            # channel nightly: release lama dibuang, tag dipindah ke commit terbaru
+            gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
+            gh release create nightly dist/* \
+              --target "$GITHUB_SHA" --title "nightly $SHA8" \
+              --notes "Auto-build main @ ${SHA8}"
+          fi

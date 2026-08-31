@@ -1,0 +1,10 @@
+# Auto-deploy oneshot — di-trigger hermes-lite-deploy.timer,
+# menjalankan /opt/hermes-lite/bin/poll-deploy.sh (dari repo deploy/poll-deploy.sh)
+[Unit]
+Description=Hermes-Lite auto-deploy (poll GitHub Releases)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hermes-lite/bin/poll-deploy.sh

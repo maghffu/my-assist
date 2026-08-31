@@ -100,3 +100,43 @@ Yang perlu dibackup cuma: `/opt/hermes-lite/.env` + `skills/` + dump Postgres
 - **web_search balas pesan konfigurasi**: `TAVILY_API_KEY` belum diisi.
 - **Telegram 409 Conflict**: ada dua proses polling token yang sama
   (`pgrep -f hermes-lite` — pastikan tidak ada sisa `nohup` manual).
+
+## Deploy Otomatis via CI (GitHub Actions) — flow baru
+
+Sejak Agustus 2026 build release **tidak lagi dilakukan di VPS** (makan
+resource, lambat). Alur baru:
+
+```
+push ke main → GitHub Actions (container rockylinux:9)
+             → tesseract/leptonica .oc9 EXACT spt VPS (repo publik OpenCloudOS)
+             → cargo build --release → tarball + sha256
+             → GitHub Release tag "nightly" (atau tag v* utk stabil)
+                 ↓ (poll tiap 5 menit, tanpa token — repo publik)
+VPS: hermes-lite-deploy.timer → poll-deploy.sh → install.sh → restart service
+```
+
+| Komponen | Lokasi | Fungsi |
+|---|---|---|
+| `.github/workflows/build-release.yml` | repo | Build CI + publish release |
+| `deploy/oc9-appstream.repo` | repo | Repo oc9 publik utk tesseract-devel 5.3.2-8.oc9 |
+| `deploy/install-release.sh` | tarball (`install.sh`) | Installer VPS (update binary/soul/unit, verifikasi service) |
+| `deploy/poll-deploy.sh` | `/opt/hermes-lite/bin/` | Poll release, cek sha256, panggil installer |
+| `deploy/hermes-lite-deploy.{service,timer}` | VPS systemd | Trigger tiap 5 menit |
+
+**Kenapa rockylinux:9 + repo oc9**: runner `ubuntu-latest` (glibc 2.39)
+menghasilkan binary yang gagal jalan di VPS (glibc 2.38), dan tesseract EL9
+tidak ada di EPEL. Dengan tesseract-devel **exact sama** (`.oc9`), DT_NEEDED
+binary CI = `libtesseract.so.5.3.2` persis seperti binary lama — tanpa
+patchelf/symlink hack.
+
+**Operasi sehari-hari:**
+
+- Deploy: cukup `git push` (live ≤ 5 menit). Log: `journalctl -u hermes-lite-deploy`
+- Cek versi terpasang: `cat /opt/hermes-lite/BUILD_INFO` & `.deployed-build`
+- Ganti channel (misal ke stabil): `echo v0.2.1 > /opt/hermes-lite/.deploy-channel`
+- Rollback manual: `systemctl stop hermes-lite-deploy.timer`, extract tarball dari
+  `/opt/hermes-lite/releases/`, `bash install.sh` (3 tarball terakhir disimpan)
+- `.env`, `skills/`, `data/`, `keys/` tidak pernah dioverwrite deploy
+
+Catatan: `deploy/deploy.sh` (build-on-VPS) tetap dipertahankan sebagai jalur
+darurat bila CI tidak bisa dipakai.
