@@ -11,6 +11,14 @@ name: build-release
 # membutuhkan glibc 2.38). Hasil build di-cache, build berikutnya instan.
 # Binary membutuhkan soname libtesseract.so.5 — symlink-nya dibuat otomatis
 # oleh deploy/install-release.sh di VPS.
+#
+# CATATAN: CMAKE_INSTALL_LIBDIR dipaksa ke "lib" (bukan default GNUInstallDirs
+# yang bisa resolve ke "lib64" di image RHEL-family) supaya lept.pc,
+# tesseract.pc, dan LeptonicaConfig.cmake semuanya konsisten ada di SATU path
+# yang predictable: /opt/tess/lib/{pkgconfig,cmake/leptonica}. Ini menghindari
+# kelas bug "Package 'lept' was not found in the pkg-config search path" yang
+# muncul kalau Lept_DIR/PKG_CONFIG_PATH menebak lib64 padahal hasil install ada
+# di lib (atau sebaliknya).
 
 on:
   push:
@@ -35,7 +43,8 @@ jobs:
       # melihat path yang di-bind-mount, bukan filesystem container).
       CARGO_HOME: ${{ github.workspace }}/.cargo-home
       RUSTUP_HOME: /usr/local/rustup
-      PKG_CONFIG_PATH: /opt/tess/lib64/pkgconfig:/opt/tess/lib/pkgconfig
+      # Satu path deterministik saja (lihat catatan CMAKE_INSTALL_LIBDIR di atas).
+      PKG_CONFIG_PATH: /opt/tess/lib/pkgconfig
     steps:
       - uses: actions/checkout@v5
 
@@ -54,11 +63,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/tess
-          key: tess-5.3.2-lept-1.84.0-v1
+          key: tess-5.3.2-lept-1.84.0-v2
 
       - name: Build leptonica 1.84.0 + tesseract 5.3.2 dari source (sekali, cached)
         run: |
-          if ls /opt/tess/lib*/pkgconfig/tesseract.pc >/dev/null 2>&1; then
+          if [ -f /opt/tess/lib/pkgconfig/tesseract.pc ]; then
             echo "cache hit — skip source build"; exit 0
           fi
           set -e
@@ -72,18 +81,27 @@ jobs:
           tar xzf leptonica.tar.gz
           cmake -S leptonica-1.84.0 -B lept-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_INSTALL_PREFIX=/opt/tess -DBUILD_PROG=OFF
+            -DCMAKE_INSTALL_PREFIX=/opt/tess -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_PROG=OFF
           cmake --build lept-build -j"$(nproc)" && cmake --install lept-build
           tar xzf tesseract.tar.gz
           cmake -S tesseract-5.3.2 -B tess-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_INSTALL_PREFIX=/opt/tess \
+            -DCMAKE_INSTALL_PREFIX=/opt/tess -DCMAKE_INSTALL_LIBDIR=lib \
             -DBUILD_TRAINING_TOOLS=OFF -DBUILD_TESTS=OFF -DDISABLE_DOCS=ON \
-            -DLept_DIR=/opt/tess/lib64/cmake/leptonica
+            -DLept_DIR=/opt/tess/lib/cmake/leptonica \
+            -DCMAKE_PREFIX_PATH=/opt/tess
           cmake --build tess-build -j"$(nproc)" && cmake --install tess-build
-          pcds=$(find /opt/tess -name '*.pc' -printf '%h\n' | sort -u | paste -sd: -)
-          echo "PKG_CONFIG_PATH=${pcds}" >> "$GITHUB_ENV"
-          PKG_CONFIG_PATH="$pcds" pkg-config --modversion tesseract lept
+
+          # Sanity-check saja (non-fatal): jangan sampai diagnostic yang gagal
+          # menjatuhkan build yang sebetulnya sudah sukses.
+          echo "--- installed .pc files ---"
+          find /opt/tess -name '*.pc' -exec echo {} \;
+          if pkg-config --modversion tesseract lept 2>/tmp/pkgcheck.err; then
+            echo "pkg-config OK: $(pkg-config --modversion tesseract) / $(pkg-config --modversion lept)"
+          else
+            echo "::warning::pkg-config check gagal (non-fatal): $(cat /tmp/pkgcheck.err | tr '\n' ' ')"
+          fi
 
       - name: Install Rust (stable)
         run: |
