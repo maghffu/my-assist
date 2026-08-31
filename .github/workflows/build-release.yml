@@ -84,6 +84,10 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=/opt/tess -DCMAKE_INSTALL_LIBDIR=lib \
             -DBUILD_PROG=OFF
           cmake --build lept-build -j"$(nproc)" && cmake --install lept-build
+          # Leptonica 1.84 meng-install 'lept_<CONFIG>.pc' (mis. lept_Release.pc)
+          # — pkg-config & leptonica-sys mencari 'lept.pc' → buat symlink.
+          (cd /opt/tess/lib/pkgconfig && ln -sf lept_Release.pc lept.pc 2>/dev/null \
+            || ln -sf "$(ls lept_*.pc | head -n1)" lept.pc)
           tar xzf tesseract.tar.gz
           cmake -S tesseract-5.3.2 -B tess-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
@@ -120,13 +124,7 @@ jobs:
           restore-keys: cargo-oc9-
 
       - name: Build
-        run: |
-          echo '--- /opt/tess contents ---'
-          find /opt/tess \( -name '*.pc' -o -name '*.so*' \) | head -20
-          pkg-config --modversion tesseract lept || true
-          cargo build --release --locked > /tmp/cargo.log 2>&1 \
-            || { echo "::error::CARGO: $(tail -c 900 /tmp/cargo.log | tr '\n' ' ')"; exit 1; }
-          tail -n 5 /tmp/cargo.log
+        run: cargo build --release --locked
 
       - name: Sanity check linkage
         run: |
