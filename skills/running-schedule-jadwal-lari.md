@@ -19,7 +19,8 @@ Triggers: jadwal lari, jadwal running, latihan hari ini, workout hari ini, log l
 
 ## Race Info
 
-- **Tanggal:** 23 Agustus 2026 (Minggu) — SUDAH SELESAI (lihat Post-Race Phase di bawah)
+- **RACE BERIKUTNYA:** 6 Desember 2026 (Minggu) — **10K**, plan lengkap 21 Sep–6 Des sudah di SCHEDULE (blok "10K RACE PLAN", long run Sabtu: 7→8→9→10 km, taper 28 Nov + race week).
+- **Race lama:** 23 Agustus 2026, 6 KM — 42:59, 6:45/km (SELESAI)
 - **Distance:** 6 KM — hasil: 42:59, 6:45/km
 - **Training start:** 6 Agustus 2026
 

@@ -1,8 +1,15 @@
 use anyhow::Result;
 use sqlx::PgPool;
 
-/// Cap karakter total per chat_id (Pilar 5 — mencegah system prompt membengkak).
-const MAX_MEMORY_CHARS: i64 = 20_000;
+/// Cap karakter fakta EXPLICIT per chat_id — melindungi budget hot tier di
+/// system prompt (10k di context.rs). Explicit selalu masuk prompt, jadi ini
+/// yang wajib ketat.
+const MAX_EXPLICIT_CHARS: i64 = 9_000;
+
+/// Safety net karakter total (explicit + inferred). Inferred hanya masuk
+/// prompt via FTS recall (budget terpisah), jadi boleh bengkak — cap besar
+/// ini hanya mencegah DB tumbuh tak terbatas.
+const MAX_TOTAL_CHARS: i64 = 100_000;
 
 pub struct MemoryFact {
     pub id: i64,
@@ -21,11 +28,27 @@ pub async fn save_fact(
             .bind(chat_id)
             .fetch_one(pool)
             .await?;
-    if used + fact.len() as i64 > MAX_MEMORY_CHARS {
+    if fact_type == "explicit" {
+        let (used_explicit,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(LENGTH(fact)), 0) FROM memory WHERE chat_id = $1 AND type = 'explicit'",
+        )
+        .bind(chat_id)
+        .fetch_one(pool)
+        .await?;
+        if used_explicit + fact.len() as i64 > MAX_EXPLICIT_CHARS {
+            return Ok(format!(
+                "⚠️ Cap explicit memory tercapai ({} karakter) — hot tier di \
+                 system prompt akan membengkak. Fakta tidak disimpan: jalankan \
+                 /dream untuk konsolidasi, atau /memory del <id>.",
+                MAX_EXPLICIT_CHARS
+            ));
+        }
+    }
+    if used + fact.len() as i64 > MAX_TOTAL_CHARS {
         return Ok(format!(
-            "⚠️ Memory cap tercapai ({} karakter). Fakta tidak disimpan — \
-             minta owner bersihkan memory lama via /memory del <id>.",
-            MAX_MEMORY_CHARS
+            "⚠️ Memory safety net tercapai ({} karakter). Fakta tidak disimpan — \
+             jalankan /dream untuk konsolidasi.",
+            MAX_TOTAL_CHARS
         ));
     }
     sqlx::query("INSERT INTO memory (chat_id, fact, type) VALUES ($1, $2, $3)")
