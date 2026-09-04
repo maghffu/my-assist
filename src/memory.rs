@@ -89,8 +89,10 @@ pub async fn save_fact(
 }
 
 pub async fn list_facts(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec<MemoryFact>> {
+    // access_count::int8 — kolom DB INT4 (migration 0005) vs Rust i64; tanpa cast,
+    // sqlx decode gagal dan MEMATIKAN setiap turn (bug deploy 7f14b38b).
     let rows = sqlx::query_as::<_, (i64, String, String, i64, DateTime<Utc>)>(
-        "SELECT id, fact, type, access_count, accessed_at FROM memory \
+        "SELECT id, fact, type, access_count::int8, accessed_at FROM memory \
          WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .bind(chat_id)
@@ -187,7 +189,7 @@ const RECALL_BUDGET_CHARS: usize = 10_000;
 pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<String> {
     // 1) Explicit — selalu (core identity owner, gak boleh hilang karena keyword miss).
     let explicit_rows = sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>)>(
-        "SELECT id, fact, access_count, accessed_at FROM memory \
+        "SELECT id, fact, access_count::int8, accessed_at FROM memory \
          WHERE chat_id = $1 AND type = 'explicit' ORDER BY id",
     )
     .bind(chat_id)
