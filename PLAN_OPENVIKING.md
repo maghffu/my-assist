@@ -293,6 +293,14 @@ Kedua migration additive-only: binary lama jalan di atas schema baru (kolom puny
 tabel baru tidak disentuh binary lama). Rollback manual bila perlu:
 `DROP TABLE session_summaries; DROP TABLE memory_changes; ALTER TABLE memory DROP COLUMN kind;`
 
+> **KOREKSI pasca-insiden 5 Sep 00:00 (downtime 2 menit):** klaim "binary lama jalan di atas
+> schema baru" hanya berlaku untuk proses yang SUDAH berjalan — binary lama yang di-RESTART
+> menolak hidup karena sqlx memvalidasi `_sqlx_migrations` versi lebih baru ("migration N
+> previously applied but is missing in the resolved migrations"). Jadi: jangan pernah apply
+> migration ke DB prod sebelum binary yang memuatnya ter-deploy (lihat gotcha di skill
+> rebuild-deploy-hermes-lite.md). Terjadi karena `cargo run -- migrate` verifikasi manual
+> dari repo menunjuk DB prod yang sama.
+
 ## Delta AGENTS.md (dilakukan saat eksekusi, bukan sekarang)
 
 - **Pilar 2:** context = window hidup + rolling session summary (tabel `session_summaries`)
