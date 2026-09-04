@@ -60,6 +60,11 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["explicit", "inferred"],
                         "description": "explicit = owner menyebutnya langsung. inferred = disimpulkan dari konteks (tandai jujur sebagai dugaan). Default: explicit."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["profile", "preference", "entity", "event", "general"],
+                        "description": "Kategori fakta: profile = identitas dasar owner (nama, lokasi, pekerjaan, keluarga); preference = preferensi & kebiasaan ('deploy suka jam malam', 'jawaban singkat'); entity = orang/proyek/objek berulang ('VPS utama 2 vCPU di Jakarta', domain, stack); event = peristiwa & keputusan bertanggal ('23 Agu ikut race 10K', 'pindah ke Postgres 17'); general = sisanya. Kalau ragu: general. Default: general."
                     }
                 },
                 "required": ["fact"]
@@ -277,6 +282,11 @@ pub async fn execute(
                 Some("inferred") => "inferred",
                 _ => "explicit",
             };
+            // Memory v3 (OV-3): kind taxonomy — nilai invalid → general (defensive).
+            let kind = input["kind"]
+                .as_str()
+                .filter(|k| memory::valid_kind(k))
+                .unwrap_or("general");
             // Memory v2 — save filter: tolak entri transien/trivial sebelum masuk DB.
             if fact_type == "inferred" && memory::is_transient_fact(&fact) {
                 return Ok(format!(
@@ -285,12 +295,12 @@ pub async fn execute(
             }
             // Semantik-dedup: near-duplicate -> UPDATE entri lama, bukan INSERT baru.
             if let Some(id) = memory::find_near_duplicate(pool, chat_id, &fact).await? {
-                memory::update_fact(pool, chat_id, id, &fact).await?;
+                memory::update_fact(pool, chat_id, id, &fact, "agent").await?;
                 return Ok(format!(
                     "\u{2705} Memory diperbarui (duplikat digabung ke id {id}): {fact}"
                 ));
             }
-            let res = memory::save_fact(pool, chat_id, &fact, fact_type).await;
+            let res = memory::save_fact(pool, chat_id, &fact, fact_type, kind, "agent").await;
             // Warning save-gagal TIDAK boleh diam-diam: log + lempar error ke owner.
             if let Err(e) = &res {
                 tracing::warn!(chat_id, "save_memory GAGAL: {e:#}");

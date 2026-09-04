@@ -23,7 +23,7 @@ kerja (run command, search, dll.), muncul pesan progres tiap langkah.\n\
 **Perintah:**\n\
 /new — reset session (hapus riwayat chat ini)\n\
 /status — uptime, provider, model\n\
-/memory — lihat fakta yang kupelajari (/memory del <id> untuk hapus)\n\
+/memory — lihat fakta yang kupelajari (/memory del <id> hapus, /memory log riwayat perubahan)\n\
 /reminders — daftar pengingat (/reminders del <id> untuk hapus)\n\
 /skills — library skill prosedural\n\
 /dream — jalankan konsolidasi memory+skills sekarang\n\
@@ -60,7 +60,7 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         BotCommand::new("new", "reset session — hapus riwayat chat ini"),
         BotCommand::new("help", "bantuan / daftar perintah"),
         BotCommand::new("status", "uptime, provider, model"),
-        BotCommand::new("memory", "fakta yang dipelajari (/memory del <id>)"),
+        BotCommand::new("memory", "fakta yang dipelajari (/memory del, /memory log)"),
         BotCommand::new("reminders", "daftar pengingat (/reminders del <id>)"),
         BotCommand::new("provider", "info AI provider aktif"),
         BotCommand::new("usage", "pemakaian token proses ini"),
@@ -304,6 +304,16 @@ fn root_cause(e: &anyhow::Error) -> String {
         .map(|(_, r)| r.trim().to_string())
         .unwrap_or(s);
     s.chars().take(300).collect()
+}
+
+/// Potong teks di boundary char (bukan byte) + ellipsis.
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}\u{2026}")
+    }
 }
 
 /// Foto dari owner: download resolusi terbesar → OCR Tesseract lokal → teks jadi
@@ -630,12 +640,62 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
                 let id: i64 = parts[2]
                     .parse()
                     .context("id harus angka — contoh: /memory del 42")?;
-                let ok = memory::delete_fact(&agent.pool, chat_id, id).await?;
+                let ok = memory::delete_fact(&agent.pool, chat_id, id, "manual").await?;
                 return Ok(if ok {
                     format!("🗑️ Memory #{} dihapus", id)
                 } else {
                     format!("Memory #{} tidak ditemukan", id)
                 });
+            }
+            // /memory log [n] — audit trail perubahan memory (OV-3)
+            if parts.len() >= 2 && parts[1] == "log" {
+                let limit: i64 = parts
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10)
+                    .clamp(1, 50);
+                let changes = memory::list_changes(&agent.pool, chat_id, limit).await?;
+                if changes.is_empty() {
+                    return Ok("(belum ada perubahan memory tercatat)".into());
+                }
+                let body = changes
+                    .iter()
+                    .map(|c| {
+                        let mem = c.memory_id.map(|m| format!("#{m}")).unwrap_or_else(|| "#?".into());
+                        let detail = match c.action.as_str() {
+                            "insert" => format!("\"{}\"", trunc(&c.new_fact.clone().unwrap_or_default(), 80)),
+                            "update" => format!(
+                                "\"{}\" → \"{}\"",
+                                trunc(&c.old_fact.clone().unwrap_or_default(), 60),
+                                trunc(&c.new_fact.clone().unwrap_or_default(), 60)
+                            ),
+                            "delete" => format!("\"{}\"", trunc(&c.old_fact.clone().unwrap_or_default(), 80)),
+                            "retype" => "inferred→explicit".into(),
+                            "reclassify" => format!(
+                                "{} → {}",
+                                c.old_kind.as_deref().unwrap_or("?"),
+                                c.new_kind.as_deref().unwrap_or("?")
+                            ),
+                            _ => c.action.clone(),
+                        };
+                        format!(
+                            "{} {} [{}] {} — {}",
+                            mem,
+                            c.action,
+                            c.source,
+                            detail,
+                            c.created_at
+                                .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap())
+                                .format("%d %b %H:%M")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(format!(
+                    "📋 **Memory log** ({} terakhir — semua jalur tulis: tool/review/dream/manual):\n{}",
+                    changes.len(),
+                    body
+                ));
             }
             let facts = memory::list_facts(&agent.pool, chat_id, 20).await?;
             if facts.is_empty() {
@@ -643,11 +703,11 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
             }
             let body = facts
                 .iter()
-                .map(|f| format!("[{}] ({}) {}", f.id, f.fact_type, f.fact))
+                .map(|f| format!("[{}] ({}|{}) {}", f.id, f.fact_type, f.kind, f.fact))
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(format!(
-                "🧠 **Memory** ({} terakhir):\n{}\n\nhapus: /memory del <id>",
+                "🧠 **Memory** ({} terakhir, kind: profile/preference/entity/event/general):\n{}\n\nhapus: /memory del <id> · riwayat perubahan: /memory log",
                 facts.len(),
                 body
             ))

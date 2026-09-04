@@ -56,7 +56,7 @@ async fn post_turn_review(agent: &Agent, chat_id: i64, user_text: &str, reply: &
     } else {
         existing
             .iter()
-            .map(|f| format!("- {} [{}]", f.fact, f.fact_type))
+            .map(|f| format!("- {} [{}|{}]", f.fact, f.fact_type, f.kind))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -72,11 +72,18 @@ async fn post_turn_review(agent: &Agent, chat_id: i64, user_text: &str, reply: &
          - \"explicit\": owner menyebutnya langsung (\"aku deploy-nya suka jam malam\")\n\
          - \"inferred\": kesimpulanmu dari konteks (\"owner mengelola VPS sendiri\") — dugaan, \
          jangan over-claim\n\
-         3. JANGAN duplikat/parafrase fakta yang sudah ada di existing memory.\n\
-         4. Tulis dari sudut pandang \"owner ...\" — satu kalimat ringkas per fakta.\n\
-         5. Maksimal {MAX_FACTS_PER_REVIEW} fakta. Kalau tidak ada yang layak: []\n\
-         6. Output HANYA JSON array valid, tanpa penjelasan, tanpa code fence:\n\
-         [{{\"fact\": \"...\", \"type\": \"explicit\"|\"inferred\"}}]\n\
+         3. Kategori (kind) fakta:\n\
+         - \"profile\": identitas dasar owner — nama, lokasi, pekerjaan, keluarga\n\
+         - \"preference\": preferensi & kebiasaan — \"deploy suka jam malam\", \"jawaban singkat\"\n\
+         - \"entity\": orang/proyek/objek yang berulang — VPS, domain, stack, proyek aktif\n\
+         - \"event\": peristiwa & keputusan bertanggal — \"23 Agu ikut race 10K\"\n\
+         - \"general\": sisanya — kalau ragu, pakai general\n\
+         4. JANGAN duplikat/parafrase fakta yang sudah ada di existing memory.\n\
+         5. Tulis dari sudut pandang \"owner ...\" — satu kalimat ringkas per fakta.\n\
+         6. Maksimal {MAX_FACTS_PER_REVIEW} fakta. Kalau tidak ada yang layak: []\n\
+         7. Output HANYA JSON array valid, tanpa penjelasan, tanpa code fence:\n\
+         [{{\"fact\": \"...\", \"type\": \"explicit\"|\"inferred\", \
+         \"kind\": \"profile\"|\"preference\"|\"entity\"|\"event\"|\"general\"}}]\n\
          \nExisting memory:\n{existing_block}"
     );
     let convo = format!("[owner]: {user_text}\n\n[assistant]: {reply}");
@@ -96,6 +103,8 @@ async fn post_turn_review(agent: &Agent, chat_id: i64, user_text: &str, reply: &
             Some("inferred") => "inferred",
             _ => "explicit",
         };
+        let kind = item["kind"].as_str().unwrap_or("");
+        let kind = if memory::valid_kind(kind) { kind } else { "general" };
         if fact.is_empty() || fact.chars().count() > MAX_FACT_CHARS {
             continue;
         }
@@ -104,8 +113,9 @@ async fn post_turn_review(agent: &Agent, chat_id: i64, user_text: &str, reply: &
             tracing::debug!(chat_id, fact = %fact, "review: fakta duplikat — skip");
             continue;
         }
-        let out = memory::save_fact(&agent.pool, chat_id, &fact, fact_type).await?;
-        tracing::info!(chat_id, fact = %fact, fact_type, "review: {out}");
+        let out =
+            memory::save_fact(&agent.pool, chat_id, &fact, fact_type, kind, "review").await?;
+        tracing::info!(chat_id, fact = %fact, fact_type, kind, "review: {out}");
         saved += 1;
     }
     if saved > 0 {
@@ -291,7 +301,8 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
 
     // A. Memory consolidation per chat
     let chat_ids = memory::distinct_chat_ids(&agent.pool).await?;
-    let (mut drop_n, mut patch_n, mut rewrite_n, mut upgrade_n) = (0, 0, 0, 0);
+    let (mut drop_n, mut patch_n, mut rewrite_n, mut upgrade_n, mut reclass_n) =
+        (0, 0, 0, 0, 0);
     for chat_id in chat_ids {
         let facts = memory::list_facts(&agent.pool, chat_id, 500).await?;
         if facts.len() < 2 {
@@ -304,7 +315,10 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             .iter()
             .map(|f| {
                 let h = memory::hotness(f.access_count, f.accessed_at, now);
-                format!("[{}] ({}) hotness={:.2} {}", f.id, f.fact_type, h, f.fact)
+                format!(
+                    "[{}] ({}|{}) hotness={:.2} {}",
+                    f.id, f.fact_type, f.kind, h, f.fact
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -322,6 +336,10 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
              atau restrukturisasi total — tulis teks barunya penuh\n\
              - \"upgrade\": [inferred] yang sudah terkonfirmasi percakapan berikutnya → \
              jadi explicit\n\
+             - \"reclassify\": ubah kategori (kind) fakta. Taxonomi: profile = identitas \
+             dasar owner; preference = preferensi & kebiasaan; entity = orang/proyek/objek \
+             berulang; event = peristiwa & keputusan bertanggal; general = sisanya. \
+             Prioritaskan baris yang masih kind=general (backfill baris lama).\n\
              \nPREFER \"patch\" untuk edit kecil; \"rewrite\" hanya untuk merge dua fakta atau \
              restrukturisasi total.\n\
              \nKONSERVATIF: kalau ragu, JANGAN usulkan apa pun. Fakta masih relevan = biarkan.\
@@ -329,7 +347,8 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
              [{{\"action\":\"drop\",\"id\":3}},\
              {{\"action\":\"patch\",\"id\":7,\"blocks\":[{{\"search\":\"...\",\"replace\":\"...\"}}]}},\
              {{\"action\":\"rewrite\",\"id\":8,\"fact\":\"...\"}},\
-             {{\"action\":\"upgrade\",\"id\":9}}]\n\
+             {{\"action\":\"upgrade\",\"id\":9}},\\n\
+             {{\"action\":\"reclassify\",\"id\":10,\"kind\":\"preference\"}}]\n\
              Kalau tidak ada perubahan: []\n\
              \nMemory:\n{listing}"
         );
@@ -364,14 +383,24 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
                 continue; // id halusinasi — skip
             }
             let res: anyhow::Result<bool> = match item["action"].as_str().unwrap_or("") {
-                "drop" => memory::delete_fact(&agent.pool, chat_id, id).await,
-                "upgrade" => memory::set_fact_type(&agent.pool, chat_id, id, "explicit").await,
+                "drop" => memory::delete_fact(&agent.pool, chat_id, id, "dream").await,
+                "upgrade" => {
+                    memory::set_fact_type(&agent.pool, chat_id, id, "explicit", "dream").await
+                }
+                "reclassify" => {
+                    let kind = item["kind"].as_str().unwrap_or("").trim().to_string();
+                    if !memory::valid_kind(&kind) {
+                        tracing::warn!(chat_id, id, kind = %kind, "dream reclassify: kind invalid — skip");
+                        continue;
+                    }
+                    memory::set_kind(&agent.pool, chat_id, id, &kind, "dream").await
+                }
                 "rewrite" => {
                     let fact = item["fact"].as_str().unwrap_or("").trim().to_string();
                     if fact.is_empty() || fact.chars().count() > MAX_FACT_CHARS {
                         continue;
                     }
-                    memory::update_fact(&agent.pool, chat_id, id, &fact).await
+                    memory::update_fact(&agent.pool, chat_id, id, &fact, "dream").await
                 }
                 "patch" => {
                     let Some(blocks_json) = item["blocks"].as_array() else {
@@ -408,7 +437,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
                     }
                     match apply_patch(&fact_txt, &blocks) {
                         Ok(new_fact) => {
-                            memory::update_fact(&agent.pool, chat_id, id, &new_fact).await
+                            memory::update_fact(&agent.pool, chat_id, id, &new_fact, "dream").await
                         }
                         Err(e) => {
                             tracing::warn!(chat_id, id, "dream patch ditolak: {e:#}");
@@ -422,6 +451,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
                 Ok(true) => match item["action"].as_str().unwrap_or("") {
                     "drop" => drop_n += 1,
                     "upgrade" => upgrade_n += 1,
+                    "reclassify" => reclass_n += 1,
                     "patch" => patch_n += 1,
                     _ => rewrite_n += 1,
                 },
@@ -431,7 +461,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
         }
     }
     summary.push_str(&format!(
-        "🧠 memory: {drop_n} dihapus, {patch_n} di-patch, {rewrite_n} digabung/ditulis ulang, {upgrade_n} inferred→explicit."
+        "🧠 memory: {drop_n} dihapus, {patch_n} di-patch, {rewrite_n} digabung/ditulis ulang, {upgrade_n} inferred→explicit, {reclass_n} reclassify."
     ));
 
     // B. Skills review
@@ -580,6 +610,8 @@ struct _DreamActionShape {
     file: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -607,6 +639,7 @@ mod tests {
             id: 1,
             fact: "Owner suka deploy di malam hari".into(),
             fact_type: "explicit".into(),
+            kind: "preference".into(),
             access_count: 0,
             accessed_at: chrono::Utc::now(),
         }];
@@ -622,16 +655,18 @@ mod tests {
     #[test]
     fn dream_action_shape_parses() {
         let v = parse_json_array(
-            r#"[{"action":"drop","id":3},{"action":"rewrite","id":7,"fact":"baru"},{"action":"upgrade","id":9},{"action":"patch","id":12,"blocks":[{"search":"lama","replace":"baru"}]}]"#,
+            r#"[{"action":"drop","id":3},{"action":"rewrite","id":7,"fact":"baru"},{"action":"upgrade","id":9},{"action":"patch","id":12,"blocks":[{"search":"lama","replace":"baru"}]},{"action":"reclassify","id":14,"kind":"entity"}]"#,
         )
         .unwrap();
         let acts: Vec<_DreamActionShape> = serde_json::from_value(v).unwrap();
-        assert_eq!(acts.len(), 4);
+        assert_eq!(acts.len(), 5);
         assert_eq!(acts[0].action, "drop");
         assert_eq!(acts[1].id, Some(7));
         assert_eq!(acts[2].action, "upgrade");
         assert_eq!(acts[3].action, "patch");
         assert_eq!(acts[3].blocks.as_ref().unwrap()[0].search, "lama");
+        assert_eq!(acts[4].action, "reclassify");
+        assert_eq!(acts[4].kind.as_deref(), Some("entity"));
     }
 
     // ── Patch merge op ────────────────────────────────────────────────────────

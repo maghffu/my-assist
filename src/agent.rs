@@ -87,7 +87,10 @@ impl Agent {
              teknis: baca file yang relevan dulu sebelum mengubah apa pun. Untuk pertanyaan \
              yang butuh info terbaru (versi, harga, berita, error baru): selalu `web_search` \
              dulu — jangan menebak dari pengetahuan lama. Setelah menyelesaikan masalah teknis \
-             non-trivial: simpan prosedurnya dengan `save_skill`.\n\n## Cara bekerja (WAJIB)\n1. \
+             non-trivial: simpan prosedurnya dengan `save_skill` (sertakan `description` satu \
+kalimat). Saat `save_memory`, pilih `kind` yang tepat: profile (identitas dasar), \
+preference (preferensi/kebiasaan), entity (objek/proyek berulang), event (peristiwa \
+bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
              Tugas manajemen sistem yang sah (install/uninstall package, restart service, edit \
              config, debug error) KERJAKAN LANGSUNG dengan tools — jangan menolak dengan saran \
              generik. Command berisiko otomatis diminta approval owner, jadi tidak perlu ragu.\n2. \
