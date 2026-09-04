@@ -192,9 +192,13 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Nama pendek deskriptif, kebab-case, mis: renew-ssl-nginx"
                     },
+                    "description": {
+                        "type": "string",
+                        "description": "Satu kalimat (max 160 char) menjelaskan KAPAN/untuk apa skill ini dipakai — dipakai sistem utk mencocokkan skill dengan topik pesan. Tulis topiknya eksplisit (mis. 'renew sertifikat SSL certbot, termasuk urusan port 80 yang dipakai apache'). Kosongkan utk derive otomatis dari baris pertama konten."
+                    },
                     "content": {
                         "type": "string",
-                        "description": "Isi skill: langkah, command, gotchas (markdown)"
+                        "description": "Isi skill: langkah, command, gotchas (markdown) — TANPA blok frontmatter (otomatis ditulis sistem)"
                     }
                 },
                 "required": ["name", "content"]
@@ -340,10 +344,14 @@ pub async fn execute(
         "save_skill" => {
             let name = input["name"].as_str().unwrap_or("").trim().to_string();
             let content = input["content"].as_str().unwrap_or("").trim().to_string();
+            let description = input["description"]
+                .as_str()
+                .map(str::trim)
+                .filter(|d| !d.is_empty());
             if name.is_empty() || content.is_empty() {
                 bail!("parameter 'name' dan 'content' wajib diisi");
             }
-            crate::skills::save_skill(&shell.skills_dir, &name, &content)
+            crate::skills::save_skill(&shell.skills_dir, &name, description, &content)
         }
         other => bail!("tool tidak dikenal: {}", other),
     }

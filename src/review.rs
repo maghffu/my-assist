@@ -454,7 +454,11 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
              - \"delete\": salah / benar-benar kedaluwarsa / duplikat (untuk MERGE dua skill: \
              rewrite yang satu dengan isi gabungan, delete satunya)\n\
              - \"rewrite\": update isi (langkah baru, gotcha tambahan, revisi command) — tulis \
-             KONTEN PENUH hasil revisi\n\
+             KONTEN PENUH hasil revisi. File skill berawalan blok frontmatter \
+             `---\ndescription: ...\n---` (L0 utk matching topik): PERTAHANKAN blok itu di kepala \
+             hasil rewrite, perbarui `description:` kalau cakupan skill berubah (satu kalimat, \
+             ≤160 char). Konten rewrite TANPA frontmatter akan otomatis di-prepend description \
+             lama oleh sistem.\n\
              \nKONSERVATIF: kalau ragu, JANGAN usulkan apa pun.\n\
              Output HANYA JSON array (tanpa penjelasan/code fence):\n\
              [{{\"action\":\"delete\",\"file\":\"x.md\"}},{{\"action\":\"rewrite\",\"file\":\"y.md\",\

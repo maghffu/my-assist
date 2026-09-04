@@ -65,10 +65,11 @@ impl Agent {
         }
     }
 
-    /// System prompt = soul (Pilar 3) + curated memory (Pilar 5) + skills (Pilar 11)
-    /// + waktu sekarang. Skill yang cocok keyword dengan pesan dimuat penuh (skills.rs).
+    /// System prompt = soul (Pilar 3) + riwayat sesi ringkas (OV-2) + curated memory
+    /// (Pilar 5) + skills (Pilar 11) + waktu sekarang. Skill yang cocok keyword dengan
+    /// pesan (nama + L0 description) dimuat penuh (skills.rs).
     fn build_system_prompt(&self, facts: &str, user_text: &str) -> String {
-        let skills_section =
+        let (skills_section, _) =
             crate::skills::section_for_prompt(std::path::Path::new(&self.cfg.skills_dir), user_text);
         format!(
             "{}\n\n---\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \

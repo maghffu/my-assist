@@ -720,7 +720,14 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
             }
             let body = metas
                 .iter()
-                .map(|s| format!("- {} ({} KB)", s.name, (s.bytes + 1023) / 1024))
+                .map(|s| {
+                    format!(
+                        "- {} — {} ({} KB)",
+                        s.name,
+                        s.description,
+                        (s.bytes + 1023) / 1024
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(format!(
