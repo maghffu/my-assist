@@ -1,0 +1,35 @@
+# Patch CI: ikutkan rollback.sh ke dalam tarball release
+#
+# Perubahan ini BELUM terpush ke GitHub — token PAT yang terpasang di VPS
+# tidak punya scope 'workflow', jadi push file .github/workflows/* ditolak.
+#
+# Cara apply (sekali saja, dari mesin dengan akses penuh):
+#   1. git apply deploy/workflow-rollback.patch
+#   2. git add .github/workflows/build-release.yml
+#   3. git commit -m "ci: ikutkan rollback.sh ke tarball release"
+#   4. git push   (pakai token dengan scope workflow, atau edit via web UI)
+#
+# Sampai patch ini terapply, rollback.sh TIDAK ikut dalam tarball CI —
+# file /opt/hermes-lite/bin/rollback.sh sudah di-install manual di VPS dan
+# tidak pernah ditimpa/dihapus oleh install.sh, jadi /rollback tetap jalan.
+# Patch ini hanya bikin rollback.sh ikut ter-ship otomatis di deploy berikutnya.
+#
+# Isi perubahan (di .github/workflows/build-release.yml, step "Package tarball"):
+#   + cp deploy/rollback.sh               dist/rollback.sh
+#   dan baris tar ... jadi:
+#     hermes-lite install.sh rollback.sh soul.md hermes-lite.service BUILD_INFO
+
+diff --git a/.github/workflows/build-release.yml b/.github/workflows/build-release.yml
+index 1111111..2222222 100644
+--- a/.github/workflows/build-release.yml
++++ b/.github/workflows/build-release.yml
+@@ -121,8 +121,9 @@
+           } > dist/BUILD_INFO
+           cp target/release/hermes-lite       dist/
+           cp deploy/install-release.sh        dist/install.sh
++          cp deploy/rollback.sh               dist/rollback.sh
+           cp soul.md deploy/hermes-lite.service dist/
+           tar -C dist -czf "dist/${NAME}.tar.gz" \
+-              hermes-lite install.sh soul.md hermes-lite.service BUILD_INFO
++              hermes-lite install.sh rollback.sh soul.md hermes-lite.service BUILD_INFO
+           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
