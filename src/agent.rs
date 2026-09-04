@@ -33,6 +33,37 @@ pub struct UsageAcc {
     pub turns: u64,
 }
 
+/// Breakdown konteks per turn (OV-4, adopsi observable retrieval OpenViking):
+/// apa saja yang masuk prompt — biar tuning recall/injection tidak guesswork.
+#[derive(Default, Clone, Debug)]
+pub struct ContextTrace {
+    pub memory_facts: usize,
+    pub memory_chars: usize,
+    pub skills_listed: usize,
+    pub skills_injected: usize,
+    pub summary_chars: usize,
+    pub history_msgs: usize,
+    pub history_chars: usize,
+    pub system_chars: usize,
+}
+
+impl ContextTrace {
+    /// Satu baris ringkas utk /status (pure fn — unit-testable).
+    pub fn fmt_summary(&self) -> String {
+        format!(
+            "memory {} fakta ({} char) | skills {}/{} di-inject | summary {} char | history {} pesan ({} char) | system {} char",
+            self.memory_facts,
+            self.memory_chars,
+            self.skills_injected,
+            self.skills_listed,
+            self.summary_chars,
+            self.history_msgs,
+            self.history_chars,
+            self.system_chars
+        )
+    }
+}
+
 pub struct Agent {
     pub pool: PgPool,
     pub provider: Arc<dyn AiProvider>,
@@ -43,6 +74,8 @@ pub struct Agent {
     pub web: Arc<WebCtx>,
     /// Token usage in-memory per proses (persist menyusul kalau terbukti perlu — ROADMAP).
     pub usage: Arc<Mutex<UsageAcc>>,
+    /// Context trace TERAKHIR saja, in-memory (OV-4) — dibaca /status.
+    pub last_trace: Arc<Mutex<Option<ContextTrace>>>,
     pub started: Instant,
 }
 
@@ -61,6 +94,7 @@ impl Agent {
             shell,
             web,
             usage: Arc::new(Mutex::new(UsageAcc::default())),
+            last_trace: Arc::new(Mutex::new(None)),
             started: Instant::now(),
         }
     }
@@ -69,16 +103,22 @@ impl Agent {
     /// (Pilar 5) + skills (Pilar 11) + waktu sekarang. Skill yang cocok keyword dengan
     /// pesan (nama + L0 description) dimuat penuh (skills.rs). `summary_section` kosong
     /// kalau belum ada arsip sesi.
-    fn build_system_prompt(&self, facts: &str, user_text: &str, summary_section: &str) -> String {
-        let (skills_section, _) =
+    fn build_system_prompt(
+        &self,
+        facts: &str,
+        user_text: &str,
+        summary_section: &str,
+    ) -> (String, crate::skills::SkillsPromptStats) {
+        let (skills_section, skills_stats) =
             crate::skills::section_for_prompt(std::path::Path::new(&self.cfg.skills_dir), user_text);
         let history_part = if summary_section.is_empty() {
             String::new()
         } else {
             format!("\n\n## Riwayat percakapan sebelumnya (ringkasan)\n{summary_section}")
         };
-        format!(
-            "{}\n\n---\n{}\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \
+        (
+            format!(
+                "{}\n\n---\n{}\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \
              owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tools: `create_reminder` \
              (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
              owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
@@ -111,6 +151,8 @@ bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
             facts,
             skills_section,
             chrono::Utc::now().to_rfc3339()
+            ),
+            skills_stats,
         )
     }
 
@@ -138,7 +180,9 @@ bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
             }
             _ => String::new(),
         };
-        let system = self.build_system_prompt(&facts, user_text, &summary_section);
+        let system_parts = self.build_system_prompt(&facts, user_text, &summary_section);
+        let system = system_parts.0;
+        let skills_stats = system_parts.1;
 
         let mut messages: Vec<ApiMessage> = if include_history {
             context::recent_messages(&self.pool, chat_id, self.cfg.n_context)
@@ -157,6 +201,47 @@ bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
         };
 
         let tool_defs = tools::definitions();
+
+        // Context trace (OV-4): breakdown konteks yang dikirim turn ini — data sudah
+        // ada di titik ini, tinggal dihitung. In-memory (trace terakhir) + log per turn.
+        {
+            let trace = ContextTrace {
+                memory_facts: facts.lines().filter(|l| l.trim_start().starts_with("- ")).count(),
+                memory_chars: facts.chars().count(),
+                skills_listed: skills_stats.listed,
+                skills_injected: skills_stats.injected,
+                summary_chars: summary_section.chars().count(),
+                history_msgs: messages.len(),
+                history_chars: messages
+                    .iter()
+                    .map(|m| {
+                        m.content
+                            .iter()
+                            .map(|b| match b {
+                                ContentBlock::Text { text } => text.chars().count(),
+                                _ => 0,
+                            })
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+                system_chars: system.chars().count(),
+            };
+            tracing::info!(
+                chat_id,
+                memory_facts = trace.memory_facts,
+                memory_chars = trace.memory_chars,
+                skills_listed = trace.skills_listed,
+                skills_injected = trace.skills_injected,
+                summary_chars = trace.summary_chars,
+                history_msgs = trace.history_msgs,
+                history_chars = trace.history_chars,
+                system_chars = trace.system_chars,
+                "context trace"
+            );
+            let mut t = self.last_trace.lock().unwrap();
+            *t = Some(trace);
+        }
+
         let mut collected_text = String::new();
         let mut last_stop = String::from("end_turn");
 
@@ -305,4 +390,29 @@ fn short_input(input: &serde_json::Value) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_trace_summary_line() {
+        let tr = ContextTrace {
+            memory_facts: 12,
+            memory_chars: 8_100,
+            skills_listed: 5,
+            skills_injected: 1,
+            summary_chars: 2_400,
+            history_msgs: 20,
+            history_chars: 7_200,
+            system_chars: 18_000,
+        };
+        let s = tr.fmt_summary();
+        assert!(s.contains("memory 12 fakta (8100 char)"), "{s}");
+        assert!(s.contains("skills 1/5 di-inject"), "{s}");
+        assert!(s.contains("summary 2400 char"), "{s}");
+        assert!(s.contains("history 20 pesan (7200 char)"), "{s}");
+        assert!(s.contains("system 18000 char"), "{s}");
+    }
 }

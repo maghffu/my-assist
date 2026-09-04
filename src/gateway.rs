@@ -630,8 +630,15 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
                 ),
                 None => "\nsummary: —".to_string(),
             };
+            let trace_line = {
+                let t = agent.last_trace.lock().unwrap();
+                match t.as_ref() {
+                    Some(tr) => format!("\nkonteks turn terakhir: {}", tr.fmt_summary()),
+                    None => "\nkonteks turn terakhir: —".to_string(),
+                }
+            };
             Ok(format!(
-                "🟢 **Hermes-Lite**\nuptime: {:.0}s\nbuild: `{}`\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir{}\ndb: terhubung ✅",
+                "🟢 **Hermes-Lite**\nuptime: {:.0}s\nbuild: `{}`\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir{}{}\ndb: terhubung ✅",
                 agent.started.elapsed().as_secs_f64(),
                 deployed_build_short(),
                 agent.provider.name(),
@@ -646,6 +653,7 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
                 if agent.cfg.tavily_api_key.is_some() { "" } else { " (⚠️ tanpa TAVILY_API_KEY)" },
                 agent.cfg.n_context,
                 summary_line,
+                trace_line,
             ))
         }
 
