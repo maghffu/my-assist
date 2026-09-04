@@ -1,2 +1,6 @@
 /target
 .env
+cgpt.txt
+cgpt_review.md
+share-session/
+*.txt
