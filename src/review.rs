@@ -132,16 +132,22 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
         if facts.len() < 2 {
             continue; // kurang dari 2 → tidak ada yang bisa digabung; skip hemat token
         }
+        // Hotness per fakta (adopsi OpenViking): skor 0-1, cold = jarang diakses & tua.
+        // LLM dipandu drop yang cold duluan, bukan asal umur entri.
+        let now = chrono::Utc::now();
         let listing = facts
             .iter()
-            .map(|f| format!("[{}] ({}) {}", f.id, f.fact_type, f.fact))
+            .map(|f| {
+                let h = memory::hotness(f.access_count, f.accessed_at, now);
+                format!("[{}] ({}) hotness={:.2} {}", f.id, f.fact_type, h, f.fact)
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
         let system = format!(
             "Kamu modul konsolidasi memori asisten pribadi (\"dreaming\"). Review SELURUH \
              memory tersimpan di bawah ini dan usulkan aksi:\n\
-             - \"drop\": tidak relevan lagi / basi / duplikat tumpang tindih\n\
+             - \"drop\": tidak relevan lagi / basi / duplikat tumpang tindih. Prioritaskan hotness rendah (<0.10 = jarang diakses & lama tak dipakai)\n\
              - \"rewrite\": gabungkan dua fakta jadi satu (rewrite satu + drop satunya) \
              atau perjelas redaksi — tulis teks barunya\n\
              - \"upgrade\": [inferred] yang sudah terkonfirmasi percakapan berikutnya → \
@@ -355,6 +361,8 @@ mod tests {
             id: 1,
             fact: "Owner suka deploy di malam hari".into(),
             fact_type: "explicit".into(),
+            access_count: 0,
+            accessed_at: chrono::Utc::now(),
         }];
         assert!(is_duplicate("owner suka deploy di malam hari", &existing)); // persis
         assert!(is_duplicate("Owner suka   deploy di malam hari sekali", &existing)); // containment

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 /// Cap karakter fakta EXPLICIT per chat_id — melindungi budget hot tier di
@@ -11,10 +12,37 @@ const MAX_EXPLICIT_CHARS: i64 = 9_000;
 /// ini hanya mencegah DB tumbuh tak terbatas.
 const MAX_TOTAL_CHARS: i64 = 100_000;
 
+/// Half-life hotness (hari) — adopsi OpenViking memory_lifecycle.
+const HOTNESS_HALF_LIFE_DAYS: f64 = 7.0;
+
 pub struct MemoryFact {
     pub id: i64,
     pub fact: String,
     pub fact_type: String,
+    pub access_count: i64,
+    pub accessed_at: DateTime<Utc>,
+}
+
+/// Hotness score (0.0–1.0): sigmoid(log1p(access_count)) * exp_decay(accessed_at).
+/// Pure function — murah dipanggil, dipakai urutan recall & prioritas /dream.
+pub fn hotness(access_count: i64, accessed_at: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    let n = access_count.max(0) as f64;
+    let freq = 1.0 / (1.0 + (-((1.0 + n).ln())).exp()); // sigmoid(log1p(n))
+    let age_days = (now - accessed_at).num_seconds().max(0) as f64 / 86_400.0;
+    let decay = (-age_days * std::f64::consts::LN_2 / HOTNESS_HALF_LIFE_DAYS).exp();
+    freq * decay
+}
+
+/// Tandai fakta barusan ter-inject ke prompt (dipanggil pasca recall).
+pub async fn bump_access(pool: &PgPool, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE memory SET access_count = access_count + 1, accessed_at = now() WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn save_fact(
@@ -61,8 +89,9 @@ pub async fn save_fact(
 }
 
 pub async fn list_facts(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec<MemoryFact>> {
-    let rows = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT id, fact, type FROM memory WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
+    let rows = sqlx::query_as::<_, (i64, String, String, i64, DateTime<Utc>)>(
+        "SELECT id, fact, type, access_count, accessed_at FROM memory \
+         WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .bind(chat_id)
     .bind(limit)
@@ -71,7 +100,13 @@ pub async fn list_facts(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec<M
 
     Ok(rows
         .into_iter()
-        .map(|(id, fact, fact_type)| MemoryFact { id, fact, fact_type })
+        .map(|(id, fact, fact_type, access_count, accessed_at)| MemoryFact {
+            id,
+            fact,
+            fact_type,
+            access_count,
+            accessed_at,
+        })
         .collect())
 }
 
@@ -93,13 +128,16 @@ pub async fn distinct_chat_ids(pool: &PgPool) -> Result<Vec<i64>> {
 }
 
 /// Tulis ulang teks fakta (dreaming: merge/rewrite) — id harus milik chat tsb.
+/// Rewrite = freshness reset (accessed_at = now), mirip merge_op OpenViking.
 pub async fn update_fact(pool: &PgPool, chat_id: i64, id: i64, fact: &str) -> Result<bool> {
-    let res = sqlx::query("UPDATE memory SET fact = $3 WHERE id = $1 AND chat_id = $2")
-        .bind(id)
-        .bind(chat_id)
-        .bind(fact)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(
+        "UPDATE memory SET fact = $3, accessed_at = now() WHERE id = $1 AND chat_id = $2",
+    )
+    .bind(id)
+    .bind(chat_id)
+    .bind(fact)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -117,15 +155,22 @@ pub async fn set_fact_type(pool: &PgPool, chat_id: i64, id: i64, fact_type: &str
     Ok(res.rows_affected() > 0)
 }
 
-/// Daftar fakta untuk disuntik ke system prompt (terlama dulu — kronologis).
+/// Daftar fakta untuk disuntik ke system prompt (urut hotness — paling sering
+/// & terakhir dipakai di atas, biar budget cut kena yang cold duluan).
 pub async fn facts_for_prompt(pool: &PgPool, chat_id: i64) -> Result<String> {
     let facts = list_facts(pool, chat_id, 200).await?;
     if facts.is_empty() {
         return Ok("(belum ada fakta tersimpan)".into());
     }
-    Ok(facts
+    let now = Utc::now();
+    let mut sorted = facts;
+    sorted.sort_by(|a, b| {
+        hotness(b.access_count, b.accessed_at, now)
+            .partial_cmp(&hotness(a.access_count, a.accessed_at, now))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(sorted
         .iter()
-        .rev()
         .map(|f| format!("- {} [{}]", f.fact, f.fact_type))
         .collect::<Vec<_>>()
         .join("\n"))
@@ -136,19 +181,29 @@ pub async fn facts_for_prompt(pool: &PgPool, chat_id: i64) -> Result<String> {
 /// Budget karakter maksimal yang di-inject ke system prompt (recall).
 const RECALL_BUDGET_CHARS: usize = 10_000;
 
-/// Recall selectif: explicit selalu masuk; inferred hanya kalau match FTS
-/// terhadap kata kunci pesan user, ATAU jika query kosong (scheduled job).
-/// Output sudah didedup + dipotong budget (explicit diprioritaskan, lalu rank).
+/// Recall selectif: explicit selalu masuk (urut hotness); inferred hanya kalau
+/// match FTS terhadap kata kunci pesan user, ATAU jika query kosong (scheduled
+/// job). Output sudah didedup + dipotong budget. IDs yang ter-inject di-bump.
 pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<String> {
     // 1) Explicit — selalu (core identity owner, gak boleh hilang karena keyword miss).
-    let explicit = sqlx::query_as::<_, (i64, String)>(
-        "SELECT id, fact FROM memory WHERE chat_id = $1 AND type = 'explicit' ORDER BY id",
+    let explicit_rows = sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>)>(
+        "SELECT id, fact, access_count, accessed_at FROM memory \
+         WHERE chat_id = $1 AND type = 'explicit' ORDER BY id",
     )
     .bind(chat_id)
     .fetch_all(pool)
     .await?;
+    let now = Utc::now();
+    let mut explicit_rows: Vec<(i64, String, i64, DateTime<Utc>)> = explicit_rows;
+    explicit_rows.sort_by(|a, b| {
+        hotness(b.2, b.3, now)
+            .partial_cmp(&hotness(a.2, a.3, now))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let explicit: Vec<(i64, String)> =
+        explicit_rows.into_iter().map(|(id, fact, ..)| (id, fact)).collect();
 
-    // 2) Inferred — FTS match kalau ada query.
+    // 2) Inferred — FTS match kalau ada query, urut rank.
     //    AND semua kata pesan user terlalu ketat (pesan panjang = pasti 0 hasil),
     //    jadi: ekstrak keywords (>=4 char, alnum), gabung OR, urut rank, threshold.
     let mut inferred: Vec<(i64, String)> = Vec::new();
@@ -179,8 +234,9 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
     // 3) Gabung + dedup (substring-case-insensitive; pola duplikat semantik "backup v1/v2").
     let mut seen: Vec<String> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
+    let mut injected_ids: Vec<i64> = Vec::new();
     let mut used = 0usize;
-    for (id, fact) in explicit.iter().chain(inferred.iter()) {
+    for (id, fact, ..) in explicit.iter().chain(inferred.iter()) {
         let low = fact.to_lowercase();
         if seen.iter().any(|s| low.contains(s.as_str()) || s.contains(&low)) {
             continue;
@@ -191,8 +247,10 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
         }
         used += line.len();
         seen.push(low);
+        injected_ids.push(*id);
         lines.push(line);
     }
+    bump_access(pool, &injected_ids).await?;
     if lines.is_empty() {
         return Ok("(belum ada fakta tersimpan)".into());
     }
@@ -245,6 +303,7 @@ pub async fn find_near_duplicate(
 #[cfg(test)]
 mod tests_v2 {
     use super::*;
+    use chrono::Duration;
 
     #[test]
     fn transient_markers_detected() {
@@ -275,8 +334,23 @@ mod tests_v2 {
             .take(12)
             .collect();
         assert!(kws.contains(&"running") && kws.contains(&"program"));
-        assert!(!kws.contains(&"kalo") || true); // 4 char — masuk, fine
         let joined = kws.join(" | ");
         assert!(joined.contains('|'));
+    }
+
+    #[test]
+    fn hotness_freq_and_decay() {
+        let now = Utc::now();
+        // Akses 0x vs 10x, sama-sama fresh: yang sering diakses lebih panas.
+        let fresh = now - Duration::hours(1);
+        let cold_acc = hotness(0, fresh, now);
+        let hot_acc = hotness(10, fresh, now);
+        assert!(hot_acc > cold_acc);
+        // Akses sama, tapi sudah lama tidak diakses: meluruh.
+        let stale = hotness(10, now - Duration::days(30), now);
+        assert!(stale < hot_acc * 0.5);
+        // Semua nilai di rentang valid.
+        assert!((0.0..=1.0).contains(&hot_acc));
+        assert!((0.0..=1.0).contains(&stale));
     }
 }
