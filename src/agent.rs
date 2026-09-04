@@ -67,12 +67,18 @@ impl Agent {
 
     /// System prompt = soul (Pilar 3) + riwayat sesi ringkas (OV-2) + curated memory
     /// (Pilar 5) + skills (Pilar 11) + waktu sekarang. Skill yang cocok keyword dengan
-    /// pesan (nama + L0 description) dimuat penuh (skills.rs).
-    fn build_system_prompt(&self, facts: &str, user_text: &str) -> String {
+    /// pesan (nama + L0 description) dimuat penuh (skills.rs). `summary_section` kosong
+    /// kalau belum ada arsip sesi.
+    fn build_system_prompt(&self, facts: &str, user_text: &str, summary_section: &str) -> String {
         let (skills_section, _) =
             crate::skills::section_for_prompt(std::path::Path::new(&self.cfg.skills_dir), user_text);
+        let history_part = if summary_section.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Riwayat percakapan sebelumnya (ringkasan)\n{summary_section}")
+        };
         format!(
-            "{}\n\n---\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \
+            "{}\n\n---\n{}\n\n## Memory — fakta tentang owner\n{}\n\n## Skills — pengetahuan prosedural\n{}\n\n## Waktu sekarang\n{} (UTC) — \
              owner di zona Asia/Jakarta (UTC+7).\n\n## Tools\nKamu punya tools: `create_reminder` \
              (pengingat / tugas terjadwal / rutinitas berulang), `save_memory` (fakta penting \
              owner), `run_command` (shell di VPS — cwd diingat antar panggilan sehingga `cd` \
@@ -101,6 +107,7 @@ bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
              hasil tiap tool sebagai input langkah berikutnya. Kalau batas langkah tercapai, \
              laporkan status terakhir dan minta owner bilang \"lanjut\".",
             soul::load(&self.cfg.soul_path),
+            history_part,
             facts,
             skills_section,
             chrono::Utc::now().to_rfc3339()
@@ -121,7 +128,17 @@ bertanggal), general (kalau ragu).\n\n## Cara bekerja (WAJIB)\n1. \
 
         // Memory v2: recall selectif — explicit selalu, inferred hanya FTS match pesan user.
         let facts = memory::recall_facts(&self.pool, chat_id, user_text).await?;
-        let system = self.build_system_prompt(&facts, user_text);
+        // Session summary (OV-2): ringkasan pesan yang sudah jatuh dari window —
+        // konteks stabil hasil distilasi. Ikut untuk scheduled job juga (include_history=
+        // false): satu-satunya cara job tahu progres terakhir (trade-off token dicatat).
+        let summary_section = match crate::summary::get_summary(&self.pool, chat_id).await? {
+            Some((s, _)) if !s.trim().is_empty() => {
+                let capped = crate::summary::trim_chars(s.trim(), crate::summary::SUMMARY_INJECT_CAP);
+                capped.trim_end().to_string()
+            }
+            _ => String::new(),
+        };
+        let system = self.build_system_prompt(&facts, user_text, &summary_section);
 
         let mut messages: Vec<ApiMessage> = if include_history {
             context::recent_messages(&self.pool, chat_id, self.cfg.n_context)

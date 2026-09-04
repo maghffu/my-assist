@@ -12,6 +12,7 @@ mod review;
 mod shell;
 mod skills;
 mod soul;
+mod summary;
 mod tools;
 mod web;
 

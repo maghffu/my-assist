@@ -274,6 +274,8 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> Result<()>
         Ok(reply) => {
             // Background review pasca-turn (Pilar 6): fire-and-forget, tanpa latency.
             review::spawn_post_turn_review(agent.clone(), chat_id, text.clone(), reply.clone());
+            // Session summary (OV-2): arsipkan pesan yang jatuh dari window — async juga.
+            crate::summary::spawn_summary_archive(agent.clone(), chat_id);
             // Hapus pesan progres — balasan final yang mewakili hasil.
             notifier.finish(None).await;
             send_long(&bot, msg.chat.id, &reply).await?;
@@ -369,6 +371,7 @@ async fn handle_photo(
         Ok(Ok(reply)) => {
             notifier.finish(None).await;
             review::spawn_post_turn_review(agent.clone(), chat_id, prompt, reply.clone());
+            crate::summary::spawn_summary_archive(agent.clone(), chat_id);
             send_long(bot, msg.chat.id, &reply).await?;
         }
         Ok(Err(e)) => {
@@ -533,6 +536,7 @@ async fn handle_document(
         Ok(Ok(reply)) => {
             notifier.finish(None).await;
             review::spawn_post_turn_review(agent.clone(), chat_id, prompt, reply.clone());
+            crate::summary::spawn_summary_archive(agent.clone(), chat_id);
             send_long(bot, msg.chat.id, &reply).await?;
         }
         Ok(Err(e)) => {
@@ -618,22 +622,32 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
     match cmd {
         "/start" | "/help" => Ok(HELP_TEXT.into()),
 
-        "/status" => Ok(format!(
-            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nbuild: `{}`\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir\ndb: terhubung ✅",
-            agent.started.elapsed().as_secs_f64(),
-            deployed_build_short(),
-            agent.provider.name(),
-            agent.provider.model_name(),
-            agent
-                .cfg
-                .anthropic_effort
-                .as_deref()
-                .map(|e| format!(" (effort: {e})"))
-                .unwrap_or_default(),
-            agent.cfg.search_provider,
-            if agent.cfg.tavily_api_key.is_some() { "" } else { " (⚠️ tanpa TAVILY_API_KEY)" },
-            agent.cfg.n_context,
-        )),
+        "/status" => {
+            let summary_line = match crate::summary::get_summary(&agent.pool, chat_id).await? {
+                Some((s, archived_to)) => format!(
+                    "\nsummary: {} char (arsip s/d msg #{archived_to})",
+                    s.chars().count()
+                ),
+                None => "\nsummary: —".to_string(),
+            };
+            Ok(format!(
+                "🟢 **Hermes-Lite**\nuptime: {:.0}s\nbuild: `{}`\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir{}\ndb: terhubung ✅",
+                agent.started.elapsed().as_secs_f64(),
+                deployed_build_short(),
+                agent.provider.name(),
+                agent.provider.model_name(),
+                agent
+                    .cfg
+                    .anthropic_effort
+                    .as_deref()
+                    .map(|e| format!(" (effort: {e})"))
+                    .unwrap_or_default(),
+                agent.cfg.search_provider,
+                if agent.cfg.tavily_api_key.is_some() { "" } else { " (⚠️ tanpa TAVILY_API_KEY)" },
+                agent.cfg.n_context,
+                summary_line,
+            ))
+        }
 
         "/memory" => {
             if parts.len() >= 3 && parts[1] == "del" {
@@ -904,10 +918,12 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
 
         "/new" => {
             // Reset session: hapus riwayat chat ini — context window langsung
-            // kosong tanpa restart. Memory & skills tidak terpengaruh.
+            // kosong tanpa restart. Ringkasan sesi ikut dihapus (OV-2 — semantik
+            // "session baru"). Memory & skills tidak terpengaruh.
             let deleted = context::clear_messages(&agent.pool, chat_id).await?;
+            let _summary_cleared = crate::summary::clear_summary(&agent.pool, chat_id).await?;
             Ok(format!(
-                "🆕 Session baru dimulai — {deleted} pesan lama dibuang. Memory & skills tetap aman."
+                "🆕 Session baru dimulai — {deleted} pesan + ringkasan sesi dibuang. Memory & skills tetap aman."
             ))
         }
 

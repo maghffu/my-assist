@@ -546,7 +546,8 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// LLM call internal (tanpa tools), return gabungan text blocks + catat usage.
-async fn call_llm_text(agent: &Agent, system: &str, messages: &[ApiMessage]) -> Result<String> {
+/// pub(crate): dipakai juga session summary (OV-2) — helper bersama, pola Pilar 6.
+pub(crate) async fn call_llm_text(agent: &Agent, system: &str, messages: &[ApiMessage]) -> Result<String> {
     let resp = agent.provider.chat(system, messages, &[]).await?;
     {
         let mut u = agent.usage.lock().unwrap();
