@@ -33,24 +33,32 @@ pub fn hotness(access_count: i64, accessed_at: DateTime<Utc>, now: DateTime<Utc>
     freq * decay
 }
 
+/// Bobot hotness pada ranking inferred recall (0 = pure FTS rank, 1 = pure hotness).
+const HOTNESS_ALPHA: f64 = 0.3;
+
+/// Skor blend inferred recall: (1-a)*rank_norm + a*hotness_norm.
+/// Normalisasi bagi-max (monotonic — urutan relatif tiap komponen terjaga).
+pub fn blend_rank_hotness(rank: f64, max_rank: f64, hot: f64, max_hot: f64) -> f64 {
+    let rn = if max_rank > 0.0 { rank / max_rank } else { 0.0 };
+    let hn = if max_hot > 0.0 { hot / max_hot } else { 0.0 };
+    (1.0 - HOTNESS_ALPHA) * rn + HOTNESS_ALPHA * hn
+}
+
 /// Tandai fakta barusan ter-inject ke prompt (dipanggil pasca recall).
 pub async fn bump_access(pool: &PgPool, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    sqlx::query("UPDATE memory SET access_count = access_count + 1, accessed_at = now() WHERE id = ANY($1)")
-        .bind(ids)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE memory SET access_count = access_count + 1, accessed_at = now() WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub async fn save_fact(
-    pool: &PgPool,
-    chat_id: i64,
-    fact: &str,
-    fact_type: &str,
-) -> Result<String> {
+pub async fn save_fact(pool: &PgPool, chat_id: i64, fact: &str, fact_type: &str) -> Result<String> {
     let (used,): (i64,) =
         sqlx::query_as("SELECT COALESCE(SUM(LENGTH(fact)), 0) FROM memory WHERE chat_id = $1")
             .bind(chat_id)
@@ -102,13 +110,15 @@ pub async fn list_facts(pool: &PgPool, chat_id: i64, limit: i64) -> Result<Vec<M
 
     Ok(rows
         .into_iter()
-        .map(|(id, fact, fact_type, access_count, accessed_at)| MemoryFact {
-            id,
-            fact,
-            fact_type,
-            access_count,
-            accessed_at,
-        })
+        .map(
+            |(id, fact, fact_type, access_count, accessed_at)| MemoryFact {
+                id,
+                fact,
+                fact_type,
+                access_count,
+                accessed_at,
+            },
+        )
         .collect())
 }
 
@@ -202,12 +212,15 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
             .partial_cmp(&hotness(a.2, a.3, now))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let explicit: Vec<(i64, String)> =
-        explicit_rows.into_iter().map(|(id, fact, ..)| (id, fact)).collect();
+    let explicit: Vec<(i64, String)> = explicit_rows
+        .into_iter()
+        .map(|(id, fact, ..)| (id, fact))
+        .collect();
 
-    // 2) Inferred — FTS match kalau ada query, urut rank.
+    // 2) Inferred — FTS match kalau ada query, ranking blend rank+hotness.
     //    AND semua kata pesan user terlalu ketat (pesan panjang = pasti 0 hasil),
-    //    jadi: ekstrak keywords (>=4 char, alnum), gabung OR, urut rank, threshold.
+    //    jadi: ekstrak keywords (>=4 char, alnum), gabung OR, threshold.
+    //    Urutan final: (1-a)*rank_norm + a*hotness_norm (adopsi OpenViking blend).
     let mut inferred: Vec<(i64, String)> = Vec::new();
     let kws: Vec<String> = query
         .to_lowercase()
@@ -218,12 +231,14 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
         .collect();
     if !kws.is_empty() {
         let or_query = kws.join(" | ");
-        inferred = sqlx::query_as::<_, (i64, String)>(
-            r#"SELECT id, fact FROM memory
+        let rows = sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>, f64)>(
+            r#"SELECT id, fact, access_count::int8, accessed_at,
+                      ts_rank(search_vector, to_tsquery('simple', $2))::float8 AS rank
+               FROM memory
                WHERE chat_id = $1 AND type = 'inferred'
                  AND search_vector @@ to_tsquery('simple', $2)
                  AND ts_rank(search_vector, to_tsquery('simple', $2)) > 0.01
-               ORDER BY ts_rank(search_vector, to_tsquery('simple', $2)) DESC
+               ORDER BY rank DESC
                LIMIT 30"#,
         )
         .bind(chat_id)
@@ -231,6 +246,28 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
         .fetch_all(pool)
         .await
         .unwrap_or_default(); // FTS gagal (misal syntax aneh) -> inferred kosong, bukan error
+                              // Blend (1-a)*rank + a*hotness; normalisasi bagi-max (monotonic per komponen).
+        if !rows.is_empty() {
+            let max_rank = rows.iter().map(|r| r.4).fold(0.0_f64, f64::max);
+            let hots: Vec<f64> = rows.iter().map(|r| hotness(r.2, r.3, now)).collect();
+            let max_hot = hots.iter().copied().fold(0.0_f64, f64::max);
+            let mut blended: Vec<(f64, i64, String)> = rows
+                .iter()
+                .zip(hots.iter())
+                .map(|(r, h)| {
+                    (
+                        blend_rank_hotness(r.4, max_rank, *h, max_hot),
+                        r.0,
+                        r.1.clone(),
+                    )
+                })
+                .collect();
+            blended.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            inferred = blended
+                .into_iter()
+                .map(|(_, id, fact)| (id, fact))
+                .collect();
+        }
     }
 
     // 3) Gabung + dedup (substring-case-insensitive; pola duplikat semantik "backup v1/v2").
@@ -240,7 +277,10 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
     let mut used = 0usize;
     for (id, fact, ..) in explicit.iter().chain(inferred.iter()) {
         let low = fact.to_lowercase();
-        if seen.iter().any(|s| low.contains(s.as_str()) || s.contains(&low)) {
+        if seen
+            .iter()
+            .any(|s| low.contains(s.as_str()) || s.contains(&low))
+        {
             continue;
         }
         let line = format!("- {} [id:{}]", fact, id);
@@ -264,10 +304,22 @@ pub fn is_transient_fact(fact: &str) -> bool {
     let f = fact.trim();
     let low = f.to_lowercase();
     let transient_markers = [
-        "owner setuju", "disetujui", "approved", "kandidat delete", "kandidat prune",
-        "menunggu konfirmasi", "menunggu keputusan", "menunggu owner", "akan dieksekusi",
-        "sedang dikerjakan", "sebentar", "in progress", "todo:", "queue ke antrian",
-        "masuk antrian", "langkah berikutnya",
+        "owner setuju",
+        "disetujui",
+        "approved",
+        "kandidat delete",
+        "kandidat prune",
+        "menunggu konfirmasi",
+        "menunggu keputusan",
+        "menunggu owner",
+        "akan dieksekusi",
+        "sedang dikerjakan",
+        "sebentar",
+        "in progress",
+        "todo:",
+        "queue ke antrian",
+        "masuk antrian",
+        "langkah berikutnya",
     ];
     if transient_markers.iter().any(|m| low.contains(m)) {
         return true;
@@ -282,11 +334,7 @@ pub fn is_transient_fact(fact: &str) -> bool {
 
 /// Semantik-dedup murah: cari entri existing dengan ts_rank sangat tinggi.
 /// Kalau ketemu → return id-nya (caller UPDATE, bukan INSERT).
-pub async fn find_near_duplicate(
-    pool: &PgPool,
-    chat_id: i64,
-    fact: &str,
-) -> Result<Option<i64>> {
+pub async fn find_near_duplicate(pool: &PgPool, chat_id: i64, fact: &str) -> Result<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as(
         r#"SELECT id FROM memory
            WHERE chat_id = $1
@@ -308,6 +356,21 @@ mod tests_v2 {
     use chrono::Duration;
 
     #[test]
+    fn blend_rank_hotness_weights_and_guards() {
+        // a=0.3: rank dominan (bobot 0.7), hotness booster (bobot 0.3).
+        let full_rank = blend_rank_hotness(1.0, 1.0, 0.0, 1.0);
+        let full_hot = blend_rank_hotness(0.0, 1.0, 1.0, 1.0);
+        assert!((full_rank - 0.7).abs() < 1e-9);
+        assert!((full_hot - 0.3).abs() < 1e-9);
+        assert!(full_rank > full_hot);
+        // Monotonik di kedua komponen.
+        assert!(blend_rank_hotness(0.8, 1.0, 0.5, 1.0) > blend_rank_hotness(0.4, 1.0, 0.5, 1.0));
+        assert!(blend_rank_hotness(0.5, 1.0, 0.9, 1.0) > blend_rank_hotness(0.5, 1.0, 0.1, 1.0));
+        // Guard max=0: hasil 0.0, bukan NaN.
+        assert!(blend_rank_hotness(0.5, 0.0, 0.5, 0.0) == 0.0);
+    }
+
+    #[test]
     fn transient_markers_detected() {
         assert!(is_transient_fact("owner setuju opsi 1"));
         assert!(is_transient_fact("menunggu keputusan owner soal race"));
@@ -322,8 +385,12 @@ mod tests_v2 {
 
     #[test]
     fn real_facts_pass() {
-        assert!(!is_transient_fact("owner lari sore biasanya jam 17:00 di Stadion REDACTED-CITY"));
-        assert!(!is_transient_fact("email SMTP pakai example.com port 465 SSL"));
+        assert!(!is_transient_fact(
+            "owner lari sore biasanya jam 17:00 di Stadion REDACTED-CITY"
+        ));
+        assert!(!is_transient_fact(
+            "email SMTP pakai example.com port 465 SSL"
+        ));
         assert!(!is_transient_fact("budget makan harian Rp 35.000"));
     }
 
