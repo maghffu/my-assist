@@ -57,8 +57,8 @@ Proses utama yang polling Telegram (`getUpdates`), terima pesan masuk, forward k
 
 **Slash commands** — diproses langsung di gateway TANPA lewat LLM (murah & deterministik): `/status` (uptime, provider aktif, resource usage), `/memory` (list + hapus fakta), `/reminders` (list + hapus), `/skills` (list skill), `/provider` (ganti provider aktif — tetap manual, sesuai non-goal), `/usage` (estimasi spend token). Biar owner bisa kelola agent langsung dari Telegram tanpa SSH ke VPS.
 
-### 2. Context (short-term history)
-History percakapan per `chat_id`, disimpan di tabel `messages`. Kirim N pesan terakhir sebagai context ke tiap API call — jangan kirim seluruh history (boros token).
+### 2. Context (short-term history + rolling session summary)
+History percakapan per `chat_id`, disimpan di tabel `messages`. Kirim N pesan terakhir sebagai context ke tiap API call — jangan kirim seluruh history (boros token). Pesan yang jatuh dari window TIDAK hilang diam-diam: diringkas jadi **rolling summary** per chat (tabel `session_summaries`, adopsi pola session-commit OpenViking) — batch terlama (≥10 pesan) di-summarize LLM secara async pasca-turn, summary konsolidat di-inject ke system prompt (juga untuk scheduled job), lalu pesan aslinya dihapus. Fail-safe: hapus hanya setelah summary commit sukses; LLM gagal → retry turn berikutnya.
 
 ### 3. Soul (persona / system prompt)
 File statis (`soul.md` atau semacamnya) berisi kepribadian, tone, dan aturan main agent. Di-load dan digabung dengan curated memory saat membangun system prompt tiap sesi. Diedit manual oleh user, bukan auto-generated.
@@ -69,7 +69,7 @@ Fitur proaktif — bukan cuma reaktif jawab pertanyaan. Reminder disimpan di tab
 **Scheduled jobs berulang** (diadopsi dari Hermes Agent Nous Research, versi minimal): baris reminder bisa berupa *job* — prompt yang **dieksekusi agent sendiri** saat trigger tiba, dengan context segar dan akses tools penuh (`web_search`, `fetch_url`, `run_command`), bukan sekadar mengirim teks statis. Contoh: daily briefing pagi (search berita → rangkum → kirim), cek backup mingguan, laporan disk space. Dua field tambahan di `reminders`: `kind` (`static` | `job`) dan `recur` (NULL = one-shot, atau `daily`/`weekly`/cron expression). Job dieksekusi dengan **budget call terbatas** supaya tidak runaway.
 
 ### 5. Memory (curated, cross-session)
-Fakta stabil tentang user yang bertahan lintas sesi, disimpan di tabel `memory` dengan **cap karakter ketat** (mencegah system prompt membengkak). Dua sumber pengisian:
+Fakta stabil tentang user yang bertahan lintas sesi, disimpan di tabel `memory` dengan **cap karakter ketat** (mencegah system prompt membengkak) dan **kind taxonomy** (`profile` | `preference` | `entity` | `event` | `general` — dipangkas dari 9 types OpenViking; baris lama default `general`, diklasifikasi ulang bertahap oleh dreaming). Semua jalur tulis (tool agent / post-turn review / dreaming / `/memory del` manual) tercatat di audit trail **`memory_changes`** (pola memory_diff OpenViking — dibaca via `/memory log`). Dua sumber pengisian:
 - **Real-time:** LLM memanggil tool `save_memory(fact)` saat mendeteksi info penting secara langsung dalam percakapan
 - **Background review** (lihat pilar 6) — proses pasif yang menangkap fakta yang terlewat
 
@@ -166,10 +166,11 @@ Menutup celah **knowledge cutoff** LLM — tanpa web access, agent buta terhadap
 Diadopsi dari fitur *autonomous skill creation* Hermes Agent (Nous Research), versi minimal. Komplementer dengan Memory (Pilar 5): **memory menyimpan fakta tentang user** ("owner deploy suka jam malam"), **skills menyimpan pengetahuan prosedural tentang cara mengerjakan sesuatu** ("cara renew sertifikat SSL di VPS ini: langkah 1-2-3, gotcha: port 80 dipakai apache").
 
 **Mekanisme:**
-- Tool `save_skill(name, content)` — saat agent berhasil menyelesaikan masalah non-trivial (setup, troubleshooting, konfigurasi, dsb.), ia menulis sendiri file skill berisi langkah, command yang terbukti jalan, dan gotchas
+- Tool `save_skill(name, description, content)` — saat agent berhasil menyelesaikan masalah non-trivial (setup, troubleshooting, konfigurasi, dsb.), ia menulis sendiri file skill berisi langkah, command yang terbukti jalan, dan gotchas
 - Storage: file markdown di direktori `skills/`, satu file per skill — human-readable, bisa diedit manual seperti `soul.md`, git-able, tanpa schema DB baru
-- Injection: daftar nama skill selalu dimuat ke system prompt; skill relevan dimuat penuh (matching sederhana by nama/keyword dulu — jangan buru-buru ke semantic matching, lihat Prinsip Retrieval)
-- **Dreaming cycle (Pilar 6) juga me-review skills** — merge duplikat, update yang outdated, hapus yang terbukti salah; edit/hapus memakai `write_file` dan pola Pilar 9
+- **L0 description frontmatter** (adopsi `.abstract.md` OpenViking): tiap file berawalan blok `---\ndescription: <satu kalimat>\n---` — di-parse manual (tanpa crate YAML); skill lama tanpa frontmatter otomatis dapat L0 fallback dari baris pertama konten
+- Injection: daftar `nama — description` selalu dimuat ke system prompt (LLM tahu topik skill yang belum dimuat); skill relevan dimuat penuh — matching token dari **nama + description** (sederhana dulu, jangan buru-buru ke semantic matching, lihat Prinsip Retrieval)
+- **Dreaming cycle (Pilar 6) juga me-review skills** — merge duplikat, update yang outdated, hapus yang terbukti salah; rewrite mempertahankan frontmatter description (safety net: prepend description lama kalau hilang)
 - Aturan hemat: JANGAN auto-save untuk hal trivial (jawaban FAQ, one-liner) — hanya masalah non-trivial yang mungkin dihadapi lagi (ditegaskan di deskripsi tool)
 
 **Kenapa file, bukan tabel:** jumlah skill single-user kecil (puluhan, bukan ribuan); file = zero-migration, mudah direview manual, konsisten dengan pola `soul.md`. Migrasi ke tabel hanya kalau terbukti butuh query/relasi (evidence-driven).
@@ -197,8 +198,10 @@ Kemampuan agent membuat gambar dari deskripsi teks dan mengirimnya ke Telegram s
 ## Skema Database (konseptual)
 
 - **`messages`** — short-term chat history per `chat_id` (role, content, timestamp)
+- **`session_summaries`** — rolling summary per chat_id (summary, archived_to, updated_at) — arsip pesan yang jatuh dari context window (Pilar 2)
 - **`reminders`** — chat_id, message, remind_at, sent (boolean), kind (`static` | `job`), recur (NULL = one-shot, atau `daily`/`weekly`/cron expression)
-- **`memory`** — chat_id, fact, type (`explicit` | `inferred`), created_at — dengan cap karakter total per chat_id
+- **`memory`** — chat_id, fact, type (`explicit` | `inferred`), kind (`profile` | `preference` | `entity` | `event` | `general`), created_at — dengan cap karakter total per chat_id
+- **`memory_changes`** — audit trail semua perubahan memory (action, old_/new_ snapshot, source `agent|review|dream|manual`, created_at) — dibaca via `/memory log`
 - **`command_logs`** — chat_id, command, exit_code, duration_ms, created_at — audit trail untuk semua eksekusi shell (Pilar 9)
 
 Semua di satu Postgres instance yang sama; tidak perlu database terpisah.
