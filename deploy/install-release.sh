@@ -12,6 +12,8 @@ APP_DIR="/opt/hermes-lite"
 SERVICE="hermes-lite"
 
 install -d -m 0750 "$APP_DIR"
+install -d -m 0755 "$APP_DIR/bin"
+install -m 0755 "$SRC/rollback.sh"        "$APP_DIR/bin/rollback.sh"
 # Soname libtesseract.so.5 (build upstream) — di VPS file-nya polos tanpa symlink
 # (paket .oc9 tanpa soname); buat symlink idempotent ke file yang ada.
 tess_real=$(ls /lib64/libtesseract.so.5.* 2>/dev/null | head -n1)

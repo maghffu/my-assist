@@ -27,6 +27,7 @@ kerja (run command, search, dll.), muncul pesan progres tiap langkah.\n\
 /reminders — daftar pengingat (/reminders del <id> untuk hapus)\n\
 /skills — library skill prosedural\n\
 /dream — jalankan konsolidasi memory+skills sekarang\n\
+/rollback — darurat: kembali ke build sebelumnya (/rollback list utk daftar)\n\
 /provider — info AI provider aktif\n\
 /usage — pemakaian token proses ini\n\
 /help — tulisan ini";
@@ -65,6 +66,7 @@ pub async fn run(bot: Bot, agent: Arc<Agent>) -> Result<()> {
         BotCommand::new("usage", "pemakaian token proses ini"),
         BotCommand::new("skills", "library skill prosedural"),
         BotCommand::new("dream", "konsolidasi memory+skills sekarang"),
+        BotCommand::new("rollback", "darurat — kembali ke build sebelumnya"),
     ];
     if let Err(e) = bot.set_my_commands(menu).await {
         tracing::warn!("gagal sinkron daftar command: {:#}", e);
@@ -585,6 +587,19 @@ fn turn_timeout_text() -> String {
     )
 }
 
+/// Build yang sedang jalan (sha8 dari .deployed-build) — utk /status & /rollback.
+fn deployed_build_short() -> String {
+    std::fs::read_to_string("/opt/hermes-lite/.deployed-build")
+        .ok()
+        .and_then(|s| {
+            let n = s.trim();
+            n.strip_prefix("hermes-lite-")
+                .and_then(|r| r.split('-').next())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "?".into())
+}
+
 /// Slash commands — diproses langsung di gateway TANPA lewat LLM (murah & deterministik).
 async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
@@ -594,8 +609,9 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
         "/start" | "/help" => Ok(HELP_TEXT.into()),
 
         "/status" => Ok(format!(
-            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir\ndb: terhubung ✅",
+            "🟢 **Hermes-Lite**\nuptime: {:.0}s\nbuild: `{}`\nprovider: `{}`\nmodel: `{}`{}\nsearch: `{}`{}\ncontext: {} pesan terakhir\ndb: terhubung ✅",
             agent.started.elapsed().as_secs_f64(),
+            deployed_build_short(),
             agent.provider.name(),
             agent.provider.model_name(),
             agent
@@ -719,6 +735,104 @@ async fn handle_command(agent: &Agent, chat_id: i64, text: &str) -> Result<Strin
             // Konsolidasi manual (loop mingguan jalan otomatis; ini utk test/darurat)
             let summary = review::run_dream(agent).await?;
             Ok(format!("💤 Dream selesai:\n{}", summary))
+        }
+
+        "/rollback" => {
+            // Escape hatch darurat: kembali ke tarball build sebelumnya (mis.
+            // deploy baru bikin bot stuck/error tiap turn). Script rollback.sh
+            // dijalankan via systemd-run (unit transient, DI LUAR cgroup service
+            // ini) supaya tetap hidup saat install.sh me-restart hermes-lite
+            // sendiri; script juga meng-stop deploy timer agar poll 5-menit
+            // tidak menimpa balik build rusak. Lihat deploy/rollback.sh.
+            let app_dir = "/opt/hermes-lite";
+            let cur = std::fs::read_to_string(format!("{app_dir}/.deployed-build"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            // Daftar tarball release (urut mtime terbaru duluan).
+            let mut builds: Vec<(std::time::SystemTime, String)> =
+                std::fs::read_dir(format!("{app_dir}/releases"))
+                    .context("tidak bisa baca direktori releases/")?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name().to_string_lossy().ends_with("-linux-x86_64.tar.gz")
+                    })
+                    .filter_map(|e| {
+                        let mtime = e.metadata().ok()?.modified().ok()?;
+                        Some((mtime, e.file_name().to_string_lossy().into_owned()))
+                    })
+                    .collect();
+            builds.sort_by(|a, b| b.0.cmp(&a.0));
+
+            let short = |n: &str| -> String {
+                n.strip_prefix("hermes-lite-")
+                    .and_then(|s| s.split('-').next())
+                    .unwrap_or("?")
+                    .to_string()
+            };
+
+            if parts.len() >= 2 && parts[1] == "list" {
+                let body = if builds.is_empty() {
+                    "(kosong)".to_string()
+                } else {
+                    builds
+                        .iter()
+                        .map(|(_, n)| {
+                            format!(
+                                "- `{}`{}",
+                                short(n),
+                                if n.as_str() == cur { " ← sekarang" } else { "" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Ok(format!(
+                    "📦 **Build tersedia di releases/**:\n{body}\n\neksekusi: /rollback",
+                ));
+            }
+
+            let Some(prev) = builds
+                .iter()
+                .find(|(_, n)| n.as_str() != cur)
+                .map(|(_, n)| n.clone())
+            else {
+                return Ok(
+                    "❌ Tidak ada build lain di releases/ — rollback tidak mungkin.\
+                     \nBuild lama dijaga oleh poll-deploy (KEEP=3)."
+                        .into(),
+                );
+            };
+
+            let unit = format!(
+                "hermes-rollback-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            );
+            let st = tokio::process::Command::new("systemd-run")
+                .args([
+                    "--quiet",
+                    "--collect",
+                    "--unit",
+                    &unit,
+                    "/opt/hermes-lite/bin/rollback.sh",
+                    &prev,
+                ])
+                .status()
+                .await
+                .context("gagal menjalankan systemd-run")?;
+            if !st.success() {
+                return Ok(format!("❌ systemd-run gagal — cek `journalctl -u {unit}`"));
+            }
+
+            Ok(format!(
+                "⏪ Rollback `{}` → `{}` dieksekusi (service restart ±10 detik).\n\
+                 ⚠️ Deploy timer di-stop otomatis supaya build rusak tidak ditimpa\
+                 \nbalik — setelah fix rilis, nyalakan lagi:\n\
+                 `systemctl start hermes-lite-deploy.timer`\n\nDaftar build: /rollback list",
+                short(&cur),
+                short(&prev),
+            ))
         }
 
         "/new" => {
