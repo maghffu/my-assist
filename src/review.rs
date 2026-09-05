@@ -1008,17 +1008,17 @@ mod tests {
     fn patch_multiple_blocks_chained() {
         let out = apply_patch(
             "Race 10K 1 Jan, pace 6:45/km",
-            &[pb("6KM", "10K"), pb("6:45/km", "6:50/km")],
+            &[pb("10K", "21K"), pb("6:45/km", "6:20/km")],
         )
         .unwrap();
-        assert_eq!(out, "Race 10K 23 Agu, pace 6:50/km");
+        assert_eq!(out, "Race 21K 1 Jan, pace 6:20/km");
     }
 
     #[test]
     fn patch_ambiguous_exact_rejected() {
         // SEARCH muncul 2x → ambigu → ditolak (fail-closed).
         let err = apply_patch(
-            "Gaji Rp1.234.567 dan bonus Rp1.234.567 tahunan",
+            "Tagihan Rp1.234.567 dan bonus Rp1.234.567 tahunan",
             &[pb("Rp1.234.567", "X")],
         );
         assert!(err.is_err());
@@ -1080,7 +1080,7 @@ mod tests {
         // Block #2 gagal → seluruh patch ditolak, block #1 tidak diterapkan.
         let err = apply_patch(
             "Race 10K 1 Jan, pace 6:45/km",
-            &[pb("6KM", "10K"), pb("tidak ada string ini", "x")],
+            &[pb("10K", "21K"), pb("tidak ada string ini", "x")],
         );
         assert!(err.is_err());
     }

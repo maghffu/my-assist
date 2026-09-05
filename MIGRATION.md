@@ -10,7 +10,7 @@
 | Memory curated | `/root/.hermes/memories/MEMORY.md` | 2.1 KB | Fakta padat per-topik, dipisah `§` (CV, email PT, pajak, server, lari, dll) |
 | Profil user | `/root/.hermes/memories/USER.md` | 1.2 KB | Identitas, preferensi bahasa/gaya, konteks bisnis PSD, NPWP/KTP, goal lari |
 | Honcho (deriver) | container `honcho-database-1`, db `postgres` | 225 documents, 86 messages, 3 collections | Derived facts hasil Deriver + dialectic (sample: "furin is based in REDACTED-CITY") |
-| Cron/jobs | `/root/.hermes/cron/jobs.json` | 3 job | (a) Renew Server H-3..H-day 15–18 Okt, (b) Running reminder harian, (c) restart-gateway [selesai, skip] |
+| Cron/jobs | `/root/.hermes/cron/jobs.json` | 3 job | (a) Renew Server H-3..H-day (tanggal di server), (b) Running reminder harian, (c) restart-gateway [selesai, skip] |
 | Skills custom | `skills/{productivity/running-schedule, devops/vps-app-ops, autonomous-ai-agents/hermes-custom-plugins}` | 3 skill (10.9/4.5/5.0 KB + references + scripts) | Teridentifikasi custom via diff terhadap `default.tar.gz` (82 skill stock) |
 | Skills stock | `skills/*` lainnya | 82 SKILL.md | Bundled bawaan Hermes Agent — menyesuaikan toolset hermes agent, bukan hermes-lite |
 | Data files | `/root/.hermes/data/` | 2 file | `running_progress.json` (log training harian), `keuangan_pt_psd.json` |
@@ -55,7 +55,7 @@
 **1a. MEMORY.md → tabel `memory`** — split per `§` (10 blok), tiap blok = 1 baris `type='explicit'`.
 Insert via SQL langsung (bukan via tool, supaya tidak kena review-cap):
 ```sql
-INSERT INTO memory (chat_id, fact, type) VALUES (REDACTED-CHAT-ID, '...', 'explicit');
+INSERT INTO memory (chat_id, fact, type) VALUES ($ALLOWED_CHAT_ID, '...', 'explicit');
 ```
 Perhatikan: blok yang berisi SMTP user/email (baris "Email PT") — password tidak ikut jika memang tidak ada di file; **credential apapun tidak masuk memory** (ingat insiden `.env` di journal kemarin). SMTP cred → `.env` hermes-lite.
 
@@ -116,19 +116,19 @@ Fix wajib:
 
 ## Fase 4 — Reminders
 
-> ✅ **SELESAI 29 Agu 2026** — job lari harian (`kind=job`, `recur=daily`, 07:50 WIB, prompt → run_command script + konvensi balas `SKIP` di hari rest) + 4 one-shot renew server (15-18 Okt 00:53 WIB). **Patch kode kecil**: `process_due_reminders` kini diam kalau job balas `SKIP` (replikasi perilaku silent-on-rest sistem lama; rebuild + redeploy binary). Fakta basi "skill running-schedule kosong" dihapus; reminder test "cek tesla" dibersihkan.
+> ✅ **SELESAI 29 Agu 2026** — job lari harian (`kind=job`, `recur=daily`, 07:50 WIB, prompt → run_command script + konvensi balas `SKIP` di hari rest) + 4 one-shot renew server (H-3..H-day, waktu trigger di server). **Patch kode kecil**: `process_due_reminders` kini diam kalau job balas `SKIP` (replikasi perilaku silent-on-rest sistem lama; rebuild + redeploy binary). Fakta basi "skill running-schedule kosong" dihapus; reminder test "cek tesla" dibersihkan.
 
 Job (c) restart-gateway: sudah `completed`+disabled → **skip**.
 
-**Job (a) Renew Server** — cron `53 0 15-18 10 *` + prompt hitung-mundur H-3..H-day.
+**Job (a) Renew Server** — cron mingguan H-3..H-day (schedule lengkap di DB) + prompt hitung-mundur.
 Cron expr belum disupport hermes-lite, tapi cron ini hanya hidup 4 hari → **konversi ke 4 baris one-shot `kind='static'`** (teks fixed, tanpa perlu LLM):
 ```sql
 -- Anchor WIB (keputusan owner 29 Agu 2026): H-3 (15 Okt), H-2, H-1, H-day
 INSERT INTO reminders (chat_id, message, remind_at, kind) VALUES
- (REDACTED-CHAT-ID, '⚠️ H-3! Renew server dalam 3 hari lagi (18 Okt 2026)', '2026-10-REDACTED 00:53:00+07', 'static'),
- (REDACTED-CHAT-ID, '🟡 H-2! ...', '2026-10-REDACTED 00:53:00+07', 'static'),
- (REDACTED-CHAT-ID, '🔴 H-1! BESOK renew server! ...', '2026-10-REDACTED 00:53:00+07', 'static'),
- (REDACTED-CHAT-ID, '🚨 HARI INI deadline renew server! ...', '2026-10-REDACTED 00:53:00+07', 'static');
+ ($ALLOWED_CHAT_ID, '⚠️ H-3! Renew server dalam 3 hari lagi', 'REDACTED', 'static'),
+ ($ALLOWED_CHAT_ID, '🟡 H-2! ...', 'REDACTED', 'static'),
+ ($ALLOWED_CHAT_ID, '🔴 H-1! BESOK renew server! ...', 'REDACTED', 'static'),
+ ($ALLOWED_CHAT_ID, '🚨 HARI INI deadline renew server! ...', 'REDACTED', 'static');
 ```
 (Timestamp WIB — keputusan final: re-anchor ke wall-clock WIB.)
 

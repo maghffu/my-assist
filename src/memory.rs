@@ -658,7 +658,7 @@ mod tests_v2 {
     fn recall_grouping_by_kind() {
         let selected = vec![
             (1, "Owner deploy suka jam malam".into(), "preference".into()),
-            (2, "Owner tinggal di REDACTED-CITY".into(), "profile".into()),
+            (2, "Owner tinggal di Kota X".into(), "profile".into()),
             (3, "VPS utama 2 vCPU di Jakarta".into(), "entity".into()),
             (4, "fakta lama tanpa kind".into(), "general".into()),
         ];
@@ -709,7 +709,7 @@ mod tests_v2 {
     #[test]
     fn real_facts_pass() {
         assert!(!is_transient_fact(
-            "owner lari sore biasanya jam 17:00 di Stadion REDACTED-CITY"
+            "owner lari sore biasanya jam 17:00 di taman kota"
         ));
         assert!(!is_transient_fact(
             "email SMTP pakai example.com port 465 SSL"

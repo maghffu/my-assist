@@ -38,7 +38,7 @@ Pendamping `AGENTS.md` (desain). File ini menjawab **urutan build, deliverable, 
 ```bash
 # Env build (GNU toolchain + w64devkit) — WAJIB sebelum cargo build di mesin ini:
 export PATH="/c/tools/w64devkit/bin:$USERPROFILE/.cargo/bin:$PATH"
-export LIBRARY_PATH="C:\\Users\\REDACTED-USER\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\self-contained"
+export LIBRARY_PATH="C:\\Users\\<user>\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\self-contained"
 
 cd /c/xampp/htdocs/my-hermes-agent
 cargo build          # ✅ hijau (2 m 21s first build)
