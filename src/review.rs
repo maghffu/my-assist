@@ -30,6 +30,15 @@ const MAX_DREAM_ACTIONS: usize = 20;
 /// berpasangan). Tanpa ini cycle tekanan mentok di 20 aksi dan butuh banyak
 /// /dream berulang untuk satu kali konsolidasi.
 const MAX_DREAM_ACTIONS_UNDER_PRESSURE: usize = 40;
+/// Iterasi LLM per chat dalam satu /dream — pass lanjutan hanya jalan selama
+/// masih over budget (lihat run_dream). Model sering gagal capai target char
+/// dalam satu pass (empiris 5 Sep: -316 dari kebutuhan -1773 karena memilih
+/// patch kecil) — iterasi dengan feedback sisa kebutuhan lebih andal daripada
+/// prompt yang lebih keras.
+const MAX_DREAM_PASSES: usize = 3;
+/// Kemajuan minimum per pass (char explicit) — di bawah ini pass berikutnya
+/// dianggap sia-sia (kandidat habis) dan iterasi dihentikan.
+const MIN_PROGRESS_CHARS: i64 = 50;
 /// Batas output token khusus dream — JSON aksi konsolidasi (hingga 20 aksi +
 /// patch blocks) butuh ruang; 8192 default sering habis oleh thinking model.
 const DREAM_MAX_TOKENS: u32 = 16_384;
@@ -309,19 +318,38 @@ fn apply_block(hay: &str, block: &PatchBlock) -> Result<String> {
 /// total char explicit (drop/merge) — menimpa aturan konservatif, karena tanpa
 /// ini dreaming selalu konservatif dan cap 9k tidak pernah turun (insiden 5 Sep:
 /// warning "cap tercapai" persisten meski /dream diulang).
+///
+/// Cycle pertama pasca-fix (5 Sep 12:05) membuktikan paragraf generik tidak
+/// cukup: LLM mendamaikannya dengan petunjuk "drop = hotness rendah" lalu justru
+/// drop 21 baris INFERRED (semuanya cold) — explicit 8973→8973, cycle gagal.
+/// Maka paragraf ini kini eksplisit: inferred bukan target (tidak membebani
+/// cap), hotness explicit = artefak tracking lama (abaikan), dan ada angka char
+/// wajib dipangkas supaya sukses cycle terukur.
 fn budget_pressure(explicit_chars: i64) -> Option<String> {
     let cap = memory::MAX_EXPLICIT_CHARS;
     if explicit_chars * 100 < cap * BUDGET_PRESSURE_PCT {
         return None;
     }
+    let target = cap * 80 / 100;
     Some(format!(
-        "\n⚠️ BUDGET EXPLICIT PENUH: {explicit_chars}/{cap} karakter (cap = hot tier \
-         system prompt; penuh = fakta explicit baru DITOLAK). PRIORITAS CYCLE INI \
-         (MENIMPA aturan konservatif di bawah): KURANGI total karakter explicit — \
-         drop status deploy/patch/event basi yang sudah lewat atau tumpang tindih, \
-         MERGE fakta serumpun jadi satu baris padat (rewrite satu + drop pasangannya). \
-         JANGAN usulkan upgrade inferred→explicit cycle ini. Target: ≤{} karakter.",
-        cap * 80 / 100
+        "\n⚠️ BUDGET EXPLICIT PENUH: {chars}/{cap} karakter (cap = hot tier system \
+         prompt; penuh = fakta explicit baru DITOLAK). PRIORITAS SATU-SATUNYA cycle ini \
+         (MENIMPA aturan konservatif dan petunjuk hotness di bawah): turunkan total char \
+         baris (explicit) minimal {need} char, sampai target ≤{target}.\n\
+         - HANYA usulkan aksi atas baris (explicit): drop yang basi / kedaluwarsa / \
+         tumpang tindih, dan MERGE fakta serumpun jadi satu baris padat (rewrite satu + \
+         drop pasangannya).\
+         - Minimal pangkas {need} char ≈ {rows} baris penuh (±200 char/baris). Banyak \
+         patch kecil TIDAK akan mencukupi — UTAMAKAN drop & merge, bukan patch.\n\
+         - JANGAN drop/patch/reclassify baris (inferred) cycle ini — inferred TIDAK \
+         membebani cap ini; menghabiskan aksi ke sana = cycle gagal.\n\
+         - JANGAN upgrade inferred→explicit (menambah char).\n\
+         - Hotness baris explicit bisa tinggi karena artefak tracking lama — ABAIKAN \
+         hotness; pilih kandidat drop dari ISI fakta, bukan dari angka hotness.",
+        chars = explicit_chars,
+        need = explicit_chars - target,
+        rows = (explicit_chars - target + 199) / 200,
+        target = target,
     ))
 }
 
@@ -336,22 +364,84 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
     let (mut drop_n, mut patch_n, mut rewrite_n, mut upgrade_n, mut reclass_n) =
         (0, 0, 0, 0, 0);
     let (mut explicit_before_total, mut explicit_after_total) = (0i64, 0i64);
+    let mut pass_total = 0usize;
     for chat_id in chat_ids {
-        let facts = memory::list_facts(&agent.pool, chat_id, 500).await?;
-        if facts.len() < 2 {
-            continue; // kurang dari 2 → tidak ada yang bisa digabung; skip hemat token
+        // Baseline laporan before→after — diukur SEBELUM pass pertama.
+        explicit_before_total += memory::explicit_chars(&agent.pool, chat_id).await?;
+        // Multi-pass: pass 0 = konsolidasi normal (reclassify dll); pass lanjutan
+        // HANYA kalau masih over budget — tiap pass melihat sisa kebutuhan char
+        // terbaru. Satu pass saja terbukti tidak memenuhi target kuantitatif
+        // (empiris 5 Sep: -316 char dari kebutuhan -1773 — model pilih patch kecil).
+        for pass in 0..MAX_DREAM_PASSES {
+            let facts = memory::list_facts(&agent.pool, chat_id, 500).await?;
+            if facts.len() < 2 {
+                break; // kurang dari 2 → tidak ada yang bisa digabung; hemat token
+            }
+            let explicit_before = memory::explicit_chars(&agent.pool, chat_id).await?;
+            let budget = budget_pressure(explicit_before).unwrap_or_default();
+            let over_budget = !budget.is_empty();
+            if pass > 0 && !over_budget {
+                break; // target tercapai — cukup
+            }
+            let max_actions = if over_budget {
+                MAX_DREAM_ACTIONS_UNDER_PRESSURE
+            } else {
+                MAX_DREAM_ACTIONS
+            };
+            let tally =
+                match dream_pass(agent, chat_id, &facts, &budget, max_actions, over_budget).await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(chat_id, pass, "dream memory pass gagal — skip: {e:#}");
+                        break;
+                    }
+                };
+            drop_n += tally.drops;
+            patch_n += tally.patches;
+            rewrite_n += tally.rewrites;
+            upgrade_n += tally.upgrades;
+            reclass_n += tally.reclassifies;
+            pass_total += 1;
+            // Kemajuan nihil saat over budget → pass berikutnya kemungkinan besar
+            // sama (kandidat habis) — stop, jangan bakar token percuma.
+            let explicit_after = memory::explicit_chars(&agent.pool, chat_id).await?;
+            if over_budget && explicit_before - explicit_after < MIN_PROGRESS_CHARS {
+                tracing::warn!(
+                    chat_id,
+                    pass,
+                    "dream pass tanpa kemajuan (<{MIN_PROGRESS_CHARS} char) — stop iterasi"
+                );
+                break;
+            }
         }
-        // Tekanan budget: explicit mepet/penuh cap → prompt minta pemangkasan
-        // (budget_pressure); dipakai juga utk hard-guard action upgrade.
-        let explicit_before = memory::explicit_chars(&agent.pool, chat_id).await?;
-        let budget = budget_pressure(explicit_before).unwrap_or_default();
-        let over_budget = !budget.is_empty();
-        let max_actions = if over_budget {
-            MAX_DREAM_ACTIONS_UNDER_PRESSURE
-        } else {
-            MAX_DREAM_ACTIONS
-        };
-        explicit_before_total += explicit_before;
+        explicit_after_total += memory::explicit_chars(&agent.pool, chat_id).await?;
+    }
+
+    // Helper lokal (item dalam blok) — isi pass konsolidasi; lihat doc di bawah.
+    /// Hitungan aksi satu pass konsolidasi (diagregasi lintas pass di run_dream).
+    #[derive(Default)]
+    struct DreamTally {
+        drops: usize,
+        patches: usize,
+        rewrites: usize,
+        upgrades: usize,
+        reclassifies: usize,
+    }
+
+    /// Satu pass konsolidasi memory utk satu chat: listing → prompt (dengan
+    /// paragraf tekanan budget bila over) → LLM → apply aksi. Orkestrasi
+    /// multi-pass ada di run_dream; fn ini tidak tahu iterasi. Fail-soft per
+    /// aksi tetap berlaku (aksi invalid di-skip, bukan membatalkan pass).
+    async fn dream_pass(
+        agent: &Agent,
+        chat_id: i64,
+        facts: &[memory::MemoryFact],
+        budget: &str,
+        max_actions: usize,
+        over_budget: bool,
+    ) -> Result<DreamTally> {
+    let mut t = DreamTally::default();
         // Hotness per fakta (adopsi OpenViking): skor 0-1, cold = jarang diakses & tua.
         // LLM dipandu drop yang cold duluan, bukan asal umur entri.
         let now = chrono::Utc::now();
@@ -404,7 +494,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             }],
         }];
 
-        let text = match call_llm_text_opts(
+        let text = call_llm_text_opts(
             agent,
             &system,
             &messages,
@@ -414,20 +504,8 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             },
         )
         .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(chat_id, "dream memory: LLM call gagal — skip: {e:#}");
-                continue;
-            }
-        };
-        let actions = match parse_json_array(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(chat_id, "dream memory: parse gagal — skip: {e:#}");
-                continue;
-            }
-        };
+        .context("dream LLM call")?;
+        let actions = parse_json_array(&text).context("dream parse output")?;
         let valid_ids: Vec<i64> = facts.iter().map(|f| f.id).collect();
         let actions_items = actions.as_array().map(|a| a.iter()).unwrap_or_default();
         for item in actions_items.take(max_actions) {
@@ -514,22 +592,27 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             };
             match res {
                 Ok(true) => match item["action"].as_str().unwrap_or("") {
-                    "drop" => drop_n += 1,
-                    "upgrade" => upgrade_n += 1,
-                    "reclassify" => reclass_n += 1,
-                    "patch" => patch_n += 1,
-                    _ => rewrite_n += 1,
+                    "drop" => t.drops += 1,
+                    "upgrade" => t.upgrades += 1,
+                    "reclassify" => t.reclassifies += 1,
+                    "patch" => t.patches += 1,
+                    _ => t.rewrites += 1,
                 },
                 Ok(false) => {}
                 Err(e) => tracing::warn!(chat_id, id, "dream memory: aksi gagal: {e:#}"),
             }
         }
-        explicit_after_total += memory::explicit_chars(&agent.pool, chat_id).await?;
+        Ok(t)
     }
     summary.push_str(&format!(
         "🧠 memory: {drop_n} dihapus, {patch_n} di-patch, {rewrite_n} digabung/ditulis ulang, \
-         {upgrade_n} inferred→explicit, {reclass_n} reclassify. \
+         {upgrade_n} inferred→explicit, {reclass_n} reclassify{} \
          explicit: {explicit_before_total} → {explicit_after_total} char / cap {}.",
+        if pass_total > 1 {
+            format!(" ({pass_total} pass).")
+        } else {
+            ". ".to_string()
+        },
         memory::MAX_EXPLICIT_CHARS
     ));
 
@@ -691,7 +774,11 @@ pub(crate) async fn call_llm_text_opts(
 }
 
 /// Parse JSON array dari output LLM yang bandel: buang code fence, ambil dari
-/// '[' pertama sampai ']' terakhir.
+/// '[' pertama sampai ']' terakhir. Kalau utuhnya rusak / terpotong, salvage
+/// objek '{...}' valid satu-satu — pola nyata glm-5.3-flash (empiris 5 Sep):
+/// ']' ditutup duluan lalu aksi ditambah lagi, string fakta mengandung karakter
+/// perusak JSON, atau ekor terpotong (max_tokens). Tanpa salvage, SATU bagian
+/// rusak membatalkan seluruh 30+ aksi valid dan fase memory di-skip diam-diam.
 fn parse_json_array(text: &str) -> Result<Value> {
     let cleaned = text
         .trim()
@@ -701,12 +788,75 @@ fn parse_json_array(text: &str) -> Result<Value> {
     let Some(start) = cleaned.find('[') else {
         bail!("tidak ada '[' dalam output");
     };
-    let Some(end) = cleaned.rfind(']') else {
-        bail!("tidak ada ']' dalam output");
+    let salvage = || -> Option<Value> {
+        let salvaged = salvage_objects(&cleaned[start..]);
+        if salvaged.is_empty() {
+            return None;
+        }
+        tracing::warn!(valid = salvaged.len(), "parse: JSON rusak — salvage objek valid");
+        Some(Value::Array(salvaged))
     };
-    let slice = &cleaned[start..=end];
-    serde_json::from_str(slice)
-        .with_context(|| format!("JSON tidak valid: {}", &slice[..slice.len().min(200)]))
+    let slice = match cleaned.rfind(']') {
+        Some(end) if end > start => &cleaned[start..=end],
+        // Tanpa ']' penutup (output terpotong) — salvage objek yang sudah lengkap.
+        _ => match salvage() {
+            Some(v) => return Ok(v),
+            None => bail!("tidak ada ']' dalam output"),
+        },
+    };
+    match serde_json::from_str(slice) {
+        Ok(v) => Ok(v),
+        Err(e) => match salvage() {
+            Some(v) => Ok(v),
+            None => Err(e).with_context(|| {
+                format!("JSON tidak valid: {}", &slice[..slice.len().min(200)])
+            }),
+        },
+    }
+}
+
+/// Ekstrak objek '{...}' top-level (brace-balanced & string-aware) dari teks,
+/// parse satu-satu, buang yang gagal — fail-soft per objek, bukan all-or-nothing.
+fn salvage_objects(text: &str) -> Vec<Value> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+            let mut j = i;
+            while j < chars.len() {
+                let c = chars[j];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                } else if c == '"' {
+                    in_str = true;
+                } else if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        let s: String = chars[i..=j].iter().collect();
+                        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                            out.push(v);
+                        }
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 // Dipakai unit test utk verifikasi bentuk aksi dreaming tanpa network.
@@ -755,6 +905,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_array_salvage_premature_close() {
+        // Pola nyata glm-5.3-flash (empiris 5 Sep): ']' ditutup duluan, aksi
+        // tambahan menyusul, ekor terpotong. Strict gagal → salvage objek valid.
+        let raw = "[{\"action\":\"drop\",\"id\":1}, oops {\"action\":\"drop\",\"id\":2}]";
+        let v = parse_json_array(raw).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1]["id"], 2);
+    }
+
+    #[test]
+    fn parse_json_array_salvage_truncated_tail() {
+        // Terpotong tanpa ']' — objek lengkap tetap diselamatkan, yang setengah dibuang.
+        let raw = "[{\"action\":\"drop\",\"id\":1},{\"action\":\"drop\",\"id\":2},{\"action\":\"rewrite\",\"id\":3,\"fact\":\"te";
+        let v = parse_json_array(raw).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2); // objek terpotong dibuang
+    }
+
+    #[test]
+    fn salvage_objects_nested_braces() {
+        // blocks:[{...}] bertingkat tidak boleh terpecah jadi objek terpisah.
+        let objs = salvage_objects("[{\"action\":\"patch\",\"id\":7,\"blocks\":[{\"search\":\"a\",\"replace\":\"b\"}],\"x\":1}]");
+        assert_eq!(objs.len(), 1);
+        assert!(objs[0]["blocks"].is_array());
+    }
+
+    #[test]
     fn budget_pressure_thresholds() {
         let cap = memory::MAX_EXPLICIT_CHARS;
         assert!(budget_pressure(100).is_none());
@@ -762,8 +940,12 @@ mod tests {
         // Kondisi insiden 5 Sep: 8973/9000 (99.7%) — WAJIB tekanan budget.
         let p = budget_pressure(8973).expect("≥85% cap harus ikut tekanan budget");
         assert!(p.contains("8973/9000"));
-        assert!(p.contains("KURANGI"));
-        assert!(p.contains("JANGAN usulkan upgrade"));
+        assert!(p.contains("minimal 1773 char")); // 8973 - 7200: sukses cycle terukur
+        assert!(p.contains("≈ 9 baris penuh")); // 1773 char ≈ 9 baris — bisa dihitung model
+        assert!(p.contains("HANYA usulkan aksi atas baris (explicit)"));
+        assert!(p.contains("JANGAN drop/patch/reclassify baris (inferred)"));
+        assert!(p.contains("JANGAN upgrade inferred→explicit"));
+        assert!(p.contains("ABAIKAN")); // hotness explicit = artefak, bukan sinyal
         assert!(budget_pressure(cap).is_some());
     }
 
