@@ -1,4 +1,4 @@
-use super::{ApiMessage, AiProvider, ContentBlock, ProviderResponse, ProviderUsage, ToolDef};
+use super::{ApiMessage, AiProvider, CallOpts, ContentBlock, ProviderResponse, ProviderUsage, ToolDef};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,13 +88,35 @@ impl AiProvider for AnthropicProvider {
         messages: &[ApiMessage],
         tools: &[ToolDef],
     ) -> Result<ProviderResponse> {
+        self.chat_opts(system, messages, tools, &CallOpts::default())
+            .await
+    }
+
+    async fn chat_opts(
+        &self,
+        system: &str,
+        messages: &[ApiMessage],
+        tools: &[ToolDef],
+        opts: &CallOpts,
+    ) -> Result<ProviderResponse> {
+        // Effort per-call (internal) menimpa effort config; None = default provider.
+        let effort = opts.effort.clone().or_else(|| self.effort.clone());
+        // output_config = ekstensi z.ai (field non-standar). API Anthropic asli
+        // menolak field tak dikenal — jangan kirim ke sana kecuali owner eksplisit
+        // opt-in via ANTHROPIC_EFFORT (berarti endpoint memang mendukung).
+        let output_config = match &effort {
+            Some(e) if !self.api_url.contains("anthropic.com") || self.effort.is_some() => {
+                Some(OutputConfig { effort: e.as_str() })
+            }
+            _ => None,
+        };
         let body = ReqBody {
             model: &self.model,
-            max_tokens: MAX_TOKENS,
+            max_tokens: opts.max_tokens.unwrap_or(MAX_TOKENS),
             system,
             messages,
             tools,
-            output_config: self.effort.as_deref().map(|e| OutputConfig { effort: e }),
+            output_config,
         };
 
         // Retry loop: error sementara (429/5xx/timeout koneksi) jangan langsung

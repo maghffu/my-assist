@@ -12,7 +12,7 @@
 
 use crate::agent::Agent;
 use crate::memory;
-use crate::provider::{ApiMessage, ContentBlock};
+use crate::provider::{ApiMessage, CallOpts, ContentBlock};
 use crate::skills;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -25,6 +25,12 @@ const MAX_FACTS_PER_REVIEW: usize = 3;
 const MAX_FACT_CHARS: usize = 300;
 /// Batas aksi dreaming per chat (fail-safe kalau LLM lepas kendali).
 const MAX_DREAM_ACTIONS: usize = 20;
+/// Batas output token khusus dream — JSON aksi konsolidasi (hingga 20 aksi +
+/// patch blocks) butuh ruang; 8192 default sering habis oleh thinking model.
+const DREAM_MAX_TOKENS: u32 = 16_384;
+/// Ambang tekanan budget explicit (% dari cap memory) — di atas ini dreaming
+/// diarahkan memangkas char & upgrade inferred→explicit ditolak (menambah char).
+const BUDGET_PRESSURE_PCT: i64 = 85;
 /// Batas SEARCH/REPLACE blocks per aksi patch (fail-safe).
 const MAX_PATCH_BLOCKS_PER_ACTION: usize = 5;
 /// Ambang kemiripan fuzzy fallback pencocokan SEARCH (levenshtein ratio).
@@ -293,6 +299,27 @@ fn apply_block(hay: &str, block: &PatchBlock) -> Result<String> {
 
 // ── Dreaming cycle (konsolidasi mingguan) ─────────────────────────────────────
 
+/// Paragraf tekanan budget utk prompt dreaming — None kalau explicit masih lega
+/// (< BUDGET_PRESSURE_PCT dari cap). Over threshold = cycle ini WAJIB memangkas
+/// total char explicit (drop/merge) — menimpa aturan konservatif, karena tanpa
+/// ini dreaming selalu konservatif dan cap 9k tidak pernah turun (insiden 5 Sep:
+/// warning "cap tercapai" persisten meski /dream diulang).
+fn budget_pressure(explicit_chars: i64) -> Option<String> {
+    let cap = memory::MAX_EXPLICIT_CHARS;
+    if explicit_chars * 100 < cap * BUDGET_PRESSURE_PCT {
+        return None;
+    }
+    Some(format!(
+        "\n⚠️ BUDGET EXPLICIT PENUH: {explicit_chars}/{cap} karakter (cap = hot tier \
+         system prompt; penuh = fakta explicit baru DITOLAK). PRIORITAS CYCLE INI \
+         (MENIMPA aturan konservatif di bawah): KURANGI total karakter explicit — \
+         drop status deploy/patch/event basi yang sudah lewat atau tumpang tindih, \
+         MERGE fakta serumpun jadi satu baris padat (rewrite satu + drop pasangannya). \
+         JANGAN usulkan upgrade inferred→explicit cycle ini. Target: ≤{} karakter.",
+        cap * 80 / 100
+    ))
+}
+
 /// Review seluruh memory (drop/patch/rewrite/upgrade) + seluruh skills (delete/rewrite).
 /// Konservatif: parse gagal → skip, aksi tidak valid → skip. Return ringkasan.
 pub async fn run_dream(agent: &Agent) -> Result<String> {
@@ -303,11 +330,17 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
     let chat_ids = memory::distinct_chat_ids(&agent.pool).await?;
     let (mut drop_n, mut patch_n, mut rewrite_n, mut upgrade_n, mut reclass_n) =
         (0, 0, 0, 0, 0);
+    let (mut explicit_before_total, mut explicit_after_total) = (0i64, 0i64);
     for chat_id in chat_ids {
         let facts = memory::list_facts(&agent.pool, chat_id, 500).await?;
         if facts.len() < 2 {
             continue; // kurang dari 2 → tidak ada yang bisa digabung; skip hemat token
         }
+        // Tekanan budget: explicit mepet/penuh cap → prompt minta pemangkasan
+        // (budget_pressure); dipakai juga utk hard-guard action upgrade.
+        let explicit_before = memory::explicit_chars(&agent.pool, chat_id).await?;
+        let budget = budget_pressure(explicit_before).unwrap_or_default();
+        explicit_before_total += explicit_before;
         // Hotness per fakta (adopsi OpenViking): skor 0-1, cold = jarang diakses & tua.
         // LLM dipandu drop yang cold duluan, bukan asal umur entri.
         let now = chrono::Utc::now();
@@ -342,6 +375,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
              Prioritaskan baris yang masih kind=general (backfill baris lama).\n\
              \nPREFER \"patch\" untuk edit kecil; \"rewrite\" hanya untuk merge dua fakta atau \
              restrukturisasi total.\n\
+             {budget}\
              \nKONSERVATIF: kalau ragu, JANGAN usulkan apa pun. Fakta masih relevan = biarkan.\
              \nOutput HANYA JSON array (tanpa penjelasan/code fence), maksimal {MAX_DREAM_ACTIONS} aksi:\n\
              [{{\"action\":\"drop\",\"id\":3}},\
@@ -359,7 +393,17 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             }],
         }];
 
-        let text = match call_llm_text(agent, &system, &messages).await {
+        let text = match call_llm_text_opts(
+            agent,
+            &system,
+            &messages,
+            &CallOpts {
+                max_tokens: Some(DREAM_MAX_TOKENS),
+                effort: Some("low".into()),
+            },
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(chat_id, "dream memory: LLM call gagal — skip: {e:#}");
@@ -385,6 +429,16 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
             let res: anyhow::Result<bool> = match item["action"].as_str().unwrap_or("") {
                 "drop" => memory::delete_fact(&agent.pool, chat_id, id, "dream").await,
                 "upgrade" => {
+                    // Over budget: upgrade inferred→explicit MENAMBAH char explicit —
+                    // tolak (prompt sudah melarang; ini hard guard utk output bandel).
+                    if !budget.is_empty() {
+                        tracing::warn!(
+                            chat_id,
+                            id,
+                            "dream upgrade ditolak — explicit over budget"
+                        );
+                        continue;
+                    }
                     memory::set_fact_type(&agent.pool, chat_id, id, "explicit", "dream").await
                 }
                 "reclassify" => {
@@ -459,9 +513,13 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
                 Err(e) => tracing::warn!(chat_id, id, "dream memory: aksi gagal: {e:#}"),
             }
         }
+        explicit_after_total += memory::explicit_chars(&agent.pool, chat_id).await?;
     }
     summary.push_str(&format!(
-        "🧠 memory: {drop_n} dihapus, {patch_n} di-patch, {rewrite_n} digabung/ditulis ulang, {upgrade_n} inferred→explicit, {reclass_n} reclassify."
+        "🧠 memory: {drop_n} dihapus, {patch_n} di-patch, {rewrite_n} digabung/ditulis ulang, \
+         {upgrade_n} inferred→explicit, {reclass_n} reclassify. \
+         explicit: {explicit_before_total} → {explicit_after_total} char / cap {}.",
+        memory::MAX_EXPLICIT_CHARS
     ));
 
     // B. Skills review
@@ -547,8 +605,37 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
 
 /// LLM call internal (tanpa tools), return gabungan text blocks + catat usage.
 /// pub(crate): dipakai juga session summary (OV-2) — helper bersama, pola Pilar 6.
-pub(crate) async fn call_llm_text(agent: &Agent, system: &str, messages: &[ApiMessage]) -> Result<String> {
-    let resp = agent.provider.chat(system, messages, &[]).await?;
+///
+/// Effort dikunci LOW: internal call = ekstraksi/konsolidasi JSON yang tidak
+/// butuh reasoning panjang. Dengan effort default (z.ai: max), thinking memakan
+/// seluruh budget max_tokens hingga TIDAK ada text block sama sekali — insiden
+/// /dream 5 Sep (konsolidasi memory skip diam-diam tiap cycle, cap 9k tak turun).
+pub(crate) async fn call_llm_text(
+    agent: &Agent,
+    system: &str,
+    messages: &[ApiMessage],
+) -> Result<String> {
+    call_llm_text_opts(
+        agent,
+        system,
+        messages,
+        &CallOpts {
+            max_tokens: None,
+            effort: Some("low".into()),
+        },
+    )
+    .await
+}
+
+/// Varian dengan opsi per-call (dream pakai max_tokens lebih besar — output JSON
+/// aksinya panjang). Lihat CallOpts (provider/mod.rs).
+pub(crate) async fn call_llm_text_opts(
+    agent: &Agent,
+    system: &str,
+    messages: &[ApiMessage],
+    opts: &CallOpts,
+) -> Result<String> {
+    let resp = agent.provider.chat_opts(system, messages, &[], opts).await?;
     {
         let mut u = agent.usage.lock().unwrap();
         u.input_tokens += resp.usage.input_tokens;
@@ -565,7 +652,29 @@ pub(crate) async fn call_llm_text(agent: &Agent, system: &str, messages: &[ApiMe
         .collect::<Vec<_>>()
         .join("");
     if text.trim().is_empty() {
-        bail!("respons LLM kosong");
+        // Jangan fail diam-diam lagi: sertakan stop_reason + potongan thinking —
+        // gejala "budget habis di reasoning" jelas terbaca di log sejak detik nol.
+        let thinking: String = resp
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let n = thinking.chars().count();
+        let snippet: String = thinking.chars().take(200).collect();
+        bail!(
+            "respons LLM tanpa text block (stop_reason={}; thinking {n} char{}) — \
+             kemungkinan max_tokens habis di reasoning: naikkan max_tokens / turunkan effort",
+            resp.stop_reason,
+            if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(", potongan: {snippet:?}")
+            }
+        );
     }
     Ok(text)
 }
@@ -632,6 +741,19 @@ mod tests {
         }
         assert!(parse_json_array("tidak ada array").is_err());
         assert!(parse_json_array("[broken").is_err());
+    }
+
+    #[test]
+    fn budget_pressure_thresholds() {
+        let cap = memory::MAX_EXPLICIT_CHARS;
+        assert!(budget_pressure(100).is_none());
+        assert!(budget_pressure(cap * 84 / 100).is_none());
+        // Kondisi insiden 5 Sep: 8973/9000 (99.7%) — WAJIB tekanan budget.
+        let p = budget_pressure(8973).expect("≥85% cap harus ikut tekanan budget");
+        assert!(p.contains("8973/9000"));
+        assert!(p.contains("KURANGI"));
+        assert!(p.contains("JANGAN usulkan upgrade"));
+        assert!(budget_pressure(cap).is_some());
     }
 
     #[test]

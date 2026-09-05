@@ -4,8 +4,8 @@ use sqlx::PgPool;
 
 /// Cap karakter fakta EXPLICIT per chat_id — melindungi budget hot tier di
 /// system prompt (10k di context.rs). Explicit selalu masuk prompt, jadi ini
-/// yang wajib ketat.
-const MAX_EXPLICIT_CHARS: i64 = 9_000;
+/// yang wajib ketat. Pub: dipakai dreaming utk tekanan budget (review.rs).
+pub const MAX_EXPLICIT_CHARS: i64 = 9_000;
 
 /// Safety net karakter total (explicit + inferred). Inferred hanya masuk
 /// prompt via FTS recall (budget terpisah), jadi boleh bengkak — cap besar
@@ -123,6 +123,18 @@ pub async fn bump_access(pool: &PgPool, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+/// Total karakter fakta explicit per chat — tekanan budget dreaming &
+/// laporan /dream (before→after). Query sama dgn guard cap di save_fact.
+pub async fn explicit_chars(pool: &PgPool, chat_id: i64) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(LENGTH(fact)), 0) FROM memory WHERE chat_id = $1 AND type = 'explicit'",
+    )
+    .bind(chat_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 pub async fn save_fact(
     pool: &PgPool,
     chat_id: i64,
@@ -137,12 +149,7 @@ pub async fn save_fact(
             .fetch_one(pool)
             .await?;
     if fact_type == "explicit" {
-        let (used_explicit,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(LENGTH(fact)), 0) FROM memory WHERE chat_id = $1 AND type = 'explicit'",
-        )
-        .bind(chat_id)
-        .fetch_one(pool)
-        .await?;
+        let used_explicit = explicit_chars(pool, chat_id).await?;
         if used_explicit + fact.len() as i64 > MAX_EXPLICIT_CHARS {
             return Ok(format!(
                 "⚠️ Cap explicit memory tercapai ({} karakter) — hot tier di \

@@ -54,6 +54,18 @@ pub struct ProviderResponse {
     pub usage: ProviderUsage,
 }
 
+/// Opsi per-call untuk jalur internal (dream/review/summary — Pilar 6):
+/// override max_tokens & thinking effort tanpa menyentuh jalur chat utama.
+/// Reasoning model (GLM) dengan effort tinggi bisa memakan seluruh budget
+/// output untuk thinking hingga TIDAK ada text block — insiden /dream 5 Sep.
+#[derive(Clone, Debug, Default)]
+pub struct CallOpts {
+    /// Override max_tokens (None = default provider, anthropic.rs MAX_TOKENS).
+    pub max_tokens: Option<u32>,
+    /// Override effort/thinking intensity (None = pakai effort config provider).
+    pub effort: Option<String>,
+}
+
 /// Trait abstraction lintas AI provider (Pilar 8).
 #[async_trait]
 pub trait AiProvider: Send + Sync {
@@ -63,6 +75,20 @@ pub trait AiProvider: Send + Sync {
         messages: &[ApiMessage],
         tools: &[ToolDef],
     ) -> Result<ProviderResponse>;
+
+    /// Varian `chat` dengan opsi per-call. Default: delegasi ke `chat` —
+    /// provider yang belum mendukung override mengabaikan opsinya, jadi
+    /// caller internal aman memanggil ini di provider manapun (Pilar 8).
+    async fn chat_opts(
+        &self,
+        system: &str,
+        messages: &[ApiMessage],
+        tools: &[ToolDef],
+        opts: &CallOpts,
+    ) -> Result<ProviderResponse> {
+        let _ = opts; // provider tanpa dukungan: opsi diabaikan, bukan error
+        self.chat(system, messages, tools).await
+    }
     fn name(&self) -> &'static str;
     fn model_name(&self) -> &str;
 }
