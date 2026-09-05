@@ -25,6 +25,11 @@ const MAX_FACTS_PER_REVIEW: usize = 3;
 const MAX_FACT_CHARS: usize = 300;
 /// Batas aksi dreaming per chat (fail-safe kalau LLM lepas kendali).
 const MAX_DREAM_ACTIONS: usize = 20;
+/// Batas aksi saat budget explicit penuh (≥BUDGET_PRESSURE_PCT) — memangkas
+/// 45+ fakta ke target 80% cap butuh >20 aksi (tiap merge = rewrite + drop
+/// berpasangan). Tanpa ini cycle tekanan mentok di 20 aksi dan butuh banyak
+/// /dream berulang untuk satu kali konsolidasi.
+const MAX_DREAM_ACTIONS_UNDER_PRESSURE: usize = 40;
 /// Batas output token khusus dream — JSON aksi konsolidasi (hingga 20 aksi +
 /// patch blocks) butuh ruang; 8192 default sering habis oleh thinking model.
 const DREAM_MAX_TOKENS: u32 = 16_384;
@@ -340,6 +345,12 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
         // (budget_pressure); dipakai juga utk hard-guard action upgrade.
         let explicit_before = memory::explicit_chars(&agent.pool, chat_id).await?;
         let budget = budget_pressure(explicit_before).unwrap_or_default();
+        let over_budget = !budget.is_empty();
+        let max_actions = if over_budget {
+            MAX_DREAM_ACTIONS_UNDER_PRESSURE
+        } else {
+            MAX_DREAM_ACTIONS
+        };
         explicit_before_total += explicit_before;
         // Hotness per fakta (adopsi OpenViking): skor 0-1, cold = jarang diakses & tua.
         // LLM dipandu drop yang cold duluan, bukan asal umur entri.
@@ -377,7 +388,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
              restrukturisasi total.\n\
              {budget}\
              \nKONSERVATIF: kalau ragu, JANGAN usulkan apa pun. Fakta masih relevan = biarkan.\
-             \nOutput HANYA JSON array (tanpa penjelasan/code fence), maksimal {MAX_DREAM_ACTIONS} aksi:\n\
+             \nOutput HANYA JSON array (tanpa penjelasan/code fence), maksimal {max_actions} aksi:\n\
              [{{\"action\":\"drop\",\"id\":3}},\
              {{\"action\":\"patch\",\"id\":7,\"blocks\":[{{\"search\":\"...\",\"replace\":\"...\"}}]}},\
              {{\"action\":\"rewrite\",\"id\":8,\"fact\":\"...\"}},\
@@ -419,7 +430,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
         };
         let valid_ids: Vec<i64> = facts.iter().map(|f| f.id).collect();
         let actions_items = actions.as_array().map(|a| a.iter()).unwrap_or_default();
-        for item in actions_items.take(MAX_DREAM_ACTIONS) {
+        for item in actions_items.take(max_actions) {
             let Some(id) = item["id"].as_i64() else {
                 continue;
             };
@@ -431,7 +442,7 @@ pub async fn run_dream(agent: &Agent) -> Result<String> {
                 "upgrade" => {
                     // Over budget: upgrade inferred→explicit MENAMBAH char explicit —
                     // tolak (prompt sudah melarang; ini hard guard utk output bandel).
-                    if !budget.is_empty() {
+                    if over_budget {
                         tracing::warn!(
                             chat_id,
                             id,

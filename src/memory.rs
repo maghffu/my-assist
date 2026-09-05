@@ -447,8 +447,8 @@ const RECALL_BUDGET_CHARS: usize = 10_000;
 /// Recall selectif: explicit selalu masuk (urut hotness); inferred hanya kalau
 /// match FTS terhadap kata kunci pesan user, ATAU jika query kosong (scheduled
 /// job). Output dikelompokkan per kind dengan sub-header (OV-3), sudah didedup
-/// + dipotong budget. IDs yang ter-inject di-bump. Budget/dedupe/hotness logic
-/// TIDAK berubah dari v2.
+/// + dipotong budget. Hanya ID inferred yang di-bump (lihat komentar inline).
+/// Budget/dedupe/hotness logic TIDAK berubah dari v2.
 pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<String> {
     // 1) Explicit — selalu (core identity owner, gak boleh hilang karena keyword miss).
     let explicit_rows = sqlx::query_as::<_, (i64, String, String, i64, DateTime<Utc>)>(
@@ -527,9 +527,18 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
     // 3) Gabung + dedup (substring-case-insensitive; pola duplikat semantik "backup v1/v2").
     let mut seen: Vec<String> = Vec::new();
     let mut selected: Vec<(i64, String, String)> = Vec::new(); // (id, fact, kind)
-    let mut injected_ids: Vec<i64> = Vec::new();
+    // Bump HANYA inferred: injection explicit unconditional (bukan sinyal
+    // relevansi query). Kalau explicit ikut di-bump tiap turn, hotness semua
+    // explicit jenuh ≈1.0 dan petunjuk dreaming "prioritaskan drop hotness
+    // rendah" mati total — insiden /dream 5 Sep: 45 fakta explicit semuanya
+    // access_count 47-49 & accessed_at identik, 0 drop meski 99,7% dari cap.
+    let mut bump_ids: Vec<i64> = Vec::new();
     let mut used = 0usize;
-    for (id, fact, kind) in explicit.iter().chain(inferred.iter()) {
+    for ((id, fact, kind), is_inferred) in explicit
+        .iter()
+        .map(|t| (t, false))
+        .chain(inferred.iter().map(|t| (t, true)))
+    {
         let low = fact.to_lowercase();
         if seen
             .iter()
@@ -543,10 +552,12 @@ pub async fn recall_facts(pool: &PgPool, chat_id: i64, query: &str) -> Result<St
         }
         used += line.len();
         seen.push(low);
-        injected_ids.push(*id);
+        if is_inferred {
+            bump_ids.push(*id);
+        }
         selected.push((*id, fact.clone(), kind.clone()));
     }
-    bump_access(pool, &injected_ids).await?;
+    bump_access(pool, &bump_ids).await?;
     if selected.is_empty() {
         return Ok("(belum ada fakta tersimpan)".into());
     }
